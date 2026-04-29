@@ -120,49 +120,6 @@ class FireflyClient:
             raise FireflyError(f"PUT tx/{group_id} -> {r.status_code}: {r.text[:300]}")
         return r.json()
 
-    def search_transactions(self, query: str, limit: int = 200) -> list[dict]:
-        """Devuelve transacciones que matcheen la query de busqueda."""
-        out: list[dict] = []
-        page = 1
-        while True:
-            r = requests.get(
-                f"{self.base}/api/v1/search/transactions",
-                headers={"Authorization": f"Bearer {self.token}", "Accept": "application/json"},
-                params={"query": query, "page": page},
-                timeout=self.timeout,
-            )
-            if r.status_code != 200:
-                raise FireflyError(f"search -> {r.status_code}: {r.text[:300]}")
-            data = r.json()
-            out.extend(data.get("data", []))
-            meta = data.get("meta", {}).get("pagination", {})
-            if page >= meta.get("total_pages", page) or len(out) >= limit:
-                break
-            page += 1
-        return out[:limit]
-
-    def update_transaction_category(self, group_id: str | int, category_name: str) -> dict:
-        """Setea category_name en TODOS los journals (splits) del grupo."""
-        # primero traemos el grupo para obtener los journal ids
-        data = self._get(f"/api/v1/transactions/{group_id}")
-        journals = data["data"]["attributes"]["transactions"]
-        new_txs = []
-        for j in journals:
-            new_txs.append({
-                "transaction_journal_id": j["transaction_journal_id"],
-                "category_name": category_name,
-            })
-        payload = {"apply_rules": False, "fire_webhooks": False, "transactions": new_txs}
-        r = requests.put(
-            f"{self.base}/api/v1/transactions/{group_id}",
-            headers=self._h(content_type=True),
-            json=payload,
-            timeout=self.timeout,
-        )
-        if r.status_code >= 300:
-            raise FireflyError(f"PUT tx/{group_id} -> {r.status_code}: {r.text[:300]}")
-        return r.json()
-
     # ---------- categories ----------
     def list_categories(self) -> list[dict]:
         return list(self._paginate("/api/v1/categories"))

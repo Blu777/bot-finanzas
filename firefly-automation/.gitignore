@@ -4,7 +4,6 @@ __pycache__/
 *.pyc
 
 # Composes con secretos reales (NO subir a GitHub).
-# Las versiones publicas son docker-compose.example.yml y firefly-truenas.example.yml.
 docker-compose.yml
 firefly-truenas.yml
 docker-compose.local.yml
