@@ -1,0 +1,34 @@
+## ===================================================================
+# mp-bot - Bot de Telegram que importa CSVs de Mercado Pago a Firefly III
+#
+# Este es el compose "publico" que vive en GitHub. NO contiene secretos.
+# Para usarlo en TrueNAS:
+#   1. Copialo y reemplaza los REPLACE_ME_* con tus valores reales.
+#   2. Pegalo en TrueNAS Apps -> Discover -> Custom App -> Install via YAML.
+#
+# La imagen se construye automaticamente via GitHub Actions y se publica
+# en GHCR (ver .github/workflows/build.yml).
+# ===================================================================
+
+services:
+  mp_bot:
+    # Cambia <usuario>/<repo> por tu owner y nombre de repo en GitHub.
+    # La imagen es privada: configura el registry ghcr.io en TrueNAS
+    # con un Personal Access Token con scope read:packages.
+    image: ghcr.io/REPLACE_ME_OWNER/REPLACE_ME_REPO/mp-bot:latest
+    container_name: mp_bot
+    restart: unless-stopped
+    environment:
+      TZ: America/Argentina/Buenos_Aires
+
+      # --- Telegram ---
+      TELEGRAM_BOT_TOKEN: "REPLACE_ME_TG_TOKEN"
+      # Chat ids autorizados (los obtenes mandandole /id al bot apenas arranca).
+      # Mientras este vacio, el bot acepta a CUALQUIERA -> usar solo para el primer arranque.
+      TELEGRAM_ALLOWED_CHATS: ""
+
+      # --- Firefly III ---
+      FIREFLY_URL: http://REPLACE_ME_FIREFLY_HOST:30105
+      FIREFLY_PERSONAL_TOKEN: "REPLACE_ME_FIREFLY_PAT"
+      FIREFLY_ASSET_ACCOUNT_ID: "1"
+      CURRENCY: ARS

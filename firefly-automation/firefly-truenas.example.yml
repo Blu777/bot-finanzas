@@ -1,0 +1,72 @@
+## ===================================================================
+# Firefly III + Postgres + Cron - stack para TrueNAS (sin secretos)
+#
+# Reemplaza los REPLACE_ME_* antes de pegar en TrueNAS Apps.
+# Generar APP_KEY:        openssl rand -base64 32   (prefijado con "base64:")
+# Generar DB_PASSWORD:    openssl rand -hex 24
+# Generar STATIC_CRON:    openssl rand -hex 16
+# ===================================================================
+
+services:
+  firefly_app:
+    container_name: firefly_app
+    depends_on:
+      firefly_db:
+        condition: service_healthy
+    environment:
+      APP_KEY: "REPLACE_ME_APP_KEY"           # base64:....
+      APP_URL: http://REPLACE_ME_HOST:30105
+      DB_CONNECTION: pgsql
+      DB_DATABASE: firefly
+      DB_HOST: firefly_db
+      DB_PASSWORD: "REPLACE_ME_DB_PASSWORD"
+      DB_PORT: '5432'
+      DB_USERNAME: firefly
+      DEFAULT_LANGUAGE: es_ES
+      DEFAULT_LOCALE: es_ES
+      MAIL_MAILER: log
+      PGID: '568'
+      PUID: '568'
+      SITE_OWNER: tu_email@example.com
+      TRUSTED_PROXIES: '**'
+      TZ: America/Argentina/Buenos_Aires
+    image: fireflyiii/core:latest
+    ports:
+      - '30105:8080'
+    restart: unless-stopped
+    volumes:
+      - /mnt/HMS/firefly/upload:/var/www/html/storage/upload
+
+  firefly_cron:
+    command: >
+      sh -c 'apk add --no-cache curl tzdata >/dev/null && echo "0 3 * * * curl
+      -s http://firefly_app:8080/api/v1/cron/$$STATIC_CRON_TOKEN" >
+      /etc/crontabs/root && crond -f -L /dev/stdout'
+    container_name: firefly_cron
+    depends_on:
+      - firefly_app
+    environment:
+      STATIC_CRON_TOKEN: "REPLACE_ME_STATIC_CRON_TOKEN"
+      TZ: America/Argentina/Buenos_Aires
+    image: alpine:3.20
+    restart: unless-stopped
+
+  firefly_db:
+    container_name: firefly_db
+    environment:
+      PGDATA: /var/lib/postgresql/data/pgdata
+      POSTGRES_DB: firefly
+      POSTGRES_PASSWORD: "REPLACE_ME_DB_PASSWORD"
+      POSTGRES_USER: firefly
+    healthcheck:
+      interval: 10s
+      retries: 10
+      test:
+        - CMD-SHELL
+        - pg_isready -U firefly -d firefly
+      timeout: 5s
+    image: postgres:16-alpine
+    restart: unless-stopped
+    user: '568:568'
+    volumes:
+      - /mnt/HMS/firefly/postgres:/var/lib/postgresql/data
