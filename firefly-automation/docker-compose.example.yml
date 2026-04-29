@@ -32,3 +32,8 @@ services:
       FIREFLY_PERSONAL_TOKEN: "REPLACE_ME_FIREFLY_PAT"
       FIREFLY_ASSET_ACCOUNT_ID: "1"
       CURRENCY: ARS
+
+      # --- Gemini (categorizacion automatica con IA) ---
+      # API key: https://aistudio.google.com/app/apikey  (free tier 1M tok/dia)
+      GEMINI_API_KEY: "REPLACE_ME_GEMINI_API_KEY"
+      GEMINI_MODEL: gemini-2.0-flash
