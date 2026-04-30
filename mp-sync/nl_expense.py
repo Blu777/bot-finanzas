@@ -145,8 +145,22 @@ def _strip_accents(s: str) -> str:
     )
 
 
+_FILLER = frozenset({
+    "transferencia", "transferida", "recibida", "enviada",
+    "pago", "compra", "venta", "cobro", "devolucion",
+    "credito", "creditos", "debito", "cuota",
+    "de", "del", "la", "el", "los", "las",
+    "a", "al", "en", "por", "con", "para", "sin",
+    "una", "uno", "un", "su", "mi",
+})
+
+
 def _descriptions_compatible(a: str, b: str) -> bool:
-    """Return True if two descriptions are similar enough to be the same tx."""
+    """Return True if two descriptions are similar enough to be the same tx.
+
+    Strips accents, lowercases, and ignores common financial filler words so
+    that the comparison focuses on the distinguishing parts (names, stores).
+    """
     a_norm = _strip_accents(a.strip().lower())
     b_norm = _strip_accents(b.strip().lower())
     if not a_norm or not b_norm:
@@ -157,8 +171,12 @@ def _descriptions_compatible(a: str, b: str) -> bool:
         return True
     words_a = set(a_norm.split())
     words_b = set(b_norm.split())
-    only_a = words_a - words_b
-    only_b = words_b - words_a
+    sig_a = words_a - _FILLER
+    sig_b = words_b - _FILLER
+    if not sig_a or not sig_b:
+        return True
+    only_a = sig_a - sig_b
+    only_b = sig_b - sig_a
     if only_a and only_b:
         return False
     return True
