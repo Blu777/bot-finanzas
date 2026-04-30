@@ -46,6 +46,8 @@ logging.basicConfig(
 log = logging.getLogger("mp-bot")
 
 
+BOT_VERSION = "1.1"
+
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ALLOWED_CHATS = {
     int(x.strip()) for x in os.environ.get("TELEGRAM_ALLOWED_CHATS", "").split(",") if x.strip()
@@ -67,6 +69,7 @@ ledger = Ledger(LOCAL_LEDGER_CSV)
 HELP = (
     "Comandos:\n"
     "  /start /help                       - este mensaje\n"
+    "  /version                           - version del bot\n"
     "  /id                                - tu chat_id\n"
     "  /categorias                        - lista categorias\n"
     "  /reglas                            - lista reglas del bot\n"
@@ -474,6 +477,12 @@ async def handle_other(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(f"```\n{result.summary()}\n```", parse_mode="Markdown")
 
 
+async def cmd_version(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _guard(update):
+        return
+    await update.message.reply_text(f"mp-sync v{BOT_VERSION}")
+
+
 async def cmd_deshacer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _guard(update):
         return
@@ -508,6 +517,7 @@ def main() -> None:
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler(["start", "help"], cmd_start))
     app.add_handler(CommandHandler("id", cmd_id))
+    app.add_handler(CommandHandler("version", cmd_version))
     app.add_handler(CommandHandler("categorias", cmd_categorias))
     app.add_handler(CommandHandler("reglas", cmd_reglas))
     app.add_handler(CommandHandler("aprender", cmd_aprender))
