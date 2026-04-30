@@ -100,7 +100,7 @@ def categorize_pending(
     gemini_api_key: str,
     *,
     tag_filter: str = "mercadopago",
-    model: str = "gemini-2.5-flash",
+    model: str = "gemini-2.5-flash-lite",
     rule_group_id: str | int | None = None,
 ) -> GeminiResult:
     """Busca transacciones taggeadas con `tag_filter` sin categoria y las clasifica con Gemini."""
