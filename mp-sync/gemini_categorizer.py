@@ -5,6 +5,7 @@ import json
 import logging
 import os
 from dataclasses import dataclass
+from datetime import datetime
 
 from google import genai
 from google.genai import types
@@ -17,9 +18,11 @@ log = logging.getLogger(__name__)
 
 
 SYSTEM_PROMPT = (
-    "Clasificador de transacciones AR (es). Recibis categorias numeradas y "
+    "Clasificador de transacciones AR (es). Recibis categorias conocidas y "
     "descripciones (una por linea con indice). Devolves SOLO un JSON array de "
-    "enteros: el indice de categoria por cada tx en orden, o -1 si ninguna encaja."
+    "strings: el nombre EXACTO de categoria por cada tx en orden. "
+    "Usa un nombre conocido o inventa uno nuevo corto si ninguna encaja bien. "
+    "Dejar vacio ('') si no hay ni idea."
 )
 
 
@@ -29,10 +32,13 @@ class GeminiResult:
     unknown: int = 0
     errors: int = 0
     details: list[str] = None
+    proposed_new: list[str] = None
 
     def __post_init__(self):
         if self.details is None:
             self.details = []
+        if self.proposed_new is None:
+            self.proposed_new = []
 
     def summary(self) -> str:
         lines = [
@@ -40,6 +46,8 @@ class GeminiResult:
             f"Sin categoria (UNKNOWN): {self.unknown}",
             f"Errores: {self.errors}",
         ]
+        if self.proposed_new:
+            lines.append(f"Categorias nuevas propuestas (no creadas): {', '.join(self.proposed_new)}")
         if self.details:
             lines.append("")
             lines.append("Detalle:")
@@ -50,17 +58,40 @@ class GeminiResult:
 
 
 def _format_tx_for_prompt(t: dict) -> dict:
-    """Extrae solo lo necesario de un grupo de Firefly (id + descripcion)."""
+    """Extrae campos utiles para clasificar por patrones (dia/monto/descripcion)."""
     j = t["attributes"]["transactions"][0]
     desc = (j.get("description") or "").strip()
     if len(desc) > 80:
         desc = desc[:80]
-    return {"id": t["id"], "description": desc}
+    date_raw = (j.get("date") or "")[:10]
+    weekday = ""
+    if date_raw:
+        try:
+            # YYYY-MM-DD -> Monday..Sunday
+            weekday = datetime.strptime(date_raw, "%Y-%m-%d").strftime("%A")
+        except ValueError:
+            weekday = ""
+    amount_raw = j.get("amount")
+    amount_abs = ""
+    try:
+        amount_abs = f"{abs(float(amount_raw)):.2f}"
+    except (TypeError, ValueError):
+        amount_abs = ""
+    return {
+        "id": t["id"],
+        "description": desc,
+        "date": date_raw,
+        "weekday": weekday,
+        "amount": amount_abs,
+    }
 
 
 def _build_prompt(txs: list[dict], categories: list[str]) -> str:
     cats_block = "\n".join(f"{i}:{c}" for i, c in enumerate(categories))
-    txs_block = "\n".join(f"{i}:{t['description']}" for i, t in enumerate(txs))
+    txs_block = "\n".join(
+        f"{i}: desc={t['description']} | date={t.get('date','')} | day={t.get('weekday','')} | amount={t.get('amount','')}"
+        for i, t in enumerate(txs)
+    )
     return f"Categorias:\n{cats_block}\n\nTxs:\n{txs_block}"
 
 
@@ -104,7 +135,7 @@ def categorize_pending(
                 config=types.GenerateContentConfig(
                     system_instruction=SYSTEM_PROMPT,
                     response_mime_type="application/json",
-                    response_schema={"type": "ARRAY", "items": {"type": "INTEGER"}},
+                    response_schema={"type": "ARRAY", "items": {"type": "STRING"}},
                     temperature=0.0,
                 ),
             ),
@@ -126,17 +157,14 @@ def categorize_pending(
         res.details.append(f"respuesta IA invalida (len={len(data) if isinstance(data, list) else '?'})")
         return res
 
-    # 4. mapear indice -> categoria y actualizar Firefly
-    n_cats = len(cats)
-    for tx, idx in zip(txs, data):
+    # 4. mapear nombre -> categoria y actualizar Firefly
+    cats_lower = {c.lower() for c in cats}
+    for tx, cat_name in zip(txs, data):
         tid = tx["id"]
         original_desc = tx["description"][:50]
-        try:
-            idx = int(idx)
-        except (TypeError, ValueError):
-            idx = -1
+        canonical = (cat_name or "").strip()
 
-        if idx < 0 or idx >= n_cats:
+        if not canonical:
             try:
                 _add_tag(client, tid, "ai-miss")
                 res.unknown += 1
@@ -146,7 +174,18 @@ def categorize_pending(
                 res.details.append(f"err tag #{tid}: {e}")
             continue
 
-        canonical = cats[idx]
+        if canonical.lower() not in cats_lower:
+            try:
+                _add_tag(client, tid, "ai-miss")
+                res.unknown += 1
+                res.details.append(f"NUEVA (sin confirmar): {original_desc} -> {canonical}")
+                if canonical not in res.proposed_new:
+                    res.proposed_new.append(canonical)
+            except Exception as e:
+                res.errors += 1
+                res.details.append(f"err tag #{tid}: {e}")
+            continue
+
         try:
             client.update_transaction_category(tid, canonical)
             _add_tag(client, tid, "ai-classified")

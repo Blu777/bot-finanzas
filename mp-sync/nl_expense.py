@@ -34,11 +34,13 @@ LEDGER_HEADERS = ["date", "description", "amount", "category", "source", "firefl
 
 SYSTEM_PROMPT = (
     "Extractor de gastos/ingresos AR (es). Recibis texto informal y categorias "
-    "numeradas. Devolves JSON estricto con:\n"
+    "conocidas. Devolves JSON estricto con:\n"
     "- amount: numero SIGNADO. Gasto=NEGATIVO, ingreso=POSITIVO. Si no aclara, "
     "asumi gasto.\n"
     "- description: texto limpio del comercio/concepto (ej: 'Supermercado chino').\n"
-    "- category_index: indice 0-based de la categoria que mejor encaje, -1 si ninguna.\n"
+    "- category_name: nombre EXACTO de categoria conocida que mejor encaje. "
+    "Si ninguna encaja bien, inventa un nombre nuevo corto y descriptivo "
+    "(ej: 'Kiosco', 'Barberia'). Deja vacio si no hay ni idea.\n"
     "- date: YYYY-MM-DD. Si no se menciona, usa la fecha de hoy indicada abajo.\n"
     "\n"
     "Conversiones:\n"
@@ -55,10 +57,10 @@ RESPONSE_SCHEMA = {
     "properties": {
         "amount": {"type": "NUMBER"},
         "description": {"type": "STRING"},
-        "category_index": {"type": "INTEGER"},
+        "category_name": {"type": "STRING"},
         "date": {"type": "STRING"},
     },
-    "required": ["amount", "description", "category_index", "date"],
+    "required": ["amount", "description", "category_name", "date"],
 }
 
 
@@ -108,8 +110,7 @@ def parse_expense(
 
     amount = float(data.get("amount") or 0)
     description = (data.get("description") or "").strip() or "Gasto"
-    idx = int(data.get("category_index", -1))
-    category = categories[idx] if 0 <= idx < len(categories) else ""
+    category = (data.get("category_name") or "").strip()
 
     dstr = (data.get("date") or today.isoformat()).strip()[:10]
     try:

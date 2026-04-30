@@ -20,10 +20,13 @@ import os
 import tempfile
 from pathlib import Path
 
-from telegram import Update
+import dataclasses
+
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -421,14 +424,38 @@ async def handle_other(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             )
             return
 
-        result = await asyncio.to_thread(
-            record_expense,
-            parsed,
-            ledger=ledger,
-            firefly=client,
-            asset_id=ASSET_ID,
-            currency=CURRENCY,
+        cat_exists = parsed.category and any(
+            c["attributes"]["name"].lower() == parsed.category.lower()
+            for c in cats_raw
         )
+        if parsed.category and not cat_exists:
+            context.chat_data["pending_nl"] = {
+                "parsed": parsed,
+            }
+            keyboard = InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            f"Crear '{parsed.category}'",
+                            callback_data="nlcat:create",
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            "Sin categoria",
+                            callback_data="nlcat:skip",
+                        )
+                    ],
+                ]
+            )
+            await update.message.reply_text(
+                f"La categoria '{parsed.category}' no existe en Firefly.\n"
+                "Queres crearla antes de guardar el gasto?",
+                reply_markup=keyboard,
+            )
+            return
+
+        result = await _do_record(parsed)
         await asyncio.to_thread(
             ledger.record_operation,
             result.action,
@@ -493,9 +520,63 @@ def main() -> None:
     app.add_handler(CommandHandler("buscar", cmd_buscar))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_other))
+    app.add_handler(CallbackQueryHandler(on_cat_confirm, pattern=r"^nlcat:"))
 
     log.info("Bot iniciado. Chats autorizados: %s", ALLOWED_CHATS or "(bloqueado - configurar ALLOWED_CHATS)")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+async def on_cat_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ""
+    pending = context.chat_data.pop("pending_nl", None)
+    if not pending:
+        await query.edit_message_text("Sesion expirada. Manda el gasto de nuevo.")
+        return
+    parsed = pending["parsed"]
+    if data == "nlcat:create":
+        try:
+            await asyncio.to_thread(client.get_or_create_category, parsed.category)
+        except Exception as e:
+            log.exception("Error creando categoria")
+            await query.edit_message_text(f"Error creando categoria: {e}")
+            return
+    elif data == "nlcat:skip":
+        parsed = dataclasses.replace(parsed, category="")
+    else:
+        await query.edit_message_text("Opcion no reconocida.")
+        return
+
+    try:
+        result = await _do_record(parsed)
+        await asyncio.to_thread(
+            ledger.record_operation,
+            result.action,
+            row=result.row,
+            status="ok",
+            message=result.message,
+        )
+    except FireflyError as e:
+        await query.edit_message_text(f"Firefly error: {e}")
+        return
+    except Exception as e:
+        log.exception("NL expense fallo")
+        await query.edit_message_text(f"Error: {e}")
+        return
+
+    await query.edit_message_text(f"```\n{result.summary()}\n```", parse_mode="Markdown")
+
+
+async def _do_record(parsed) -> "RecordResult":
+    return await asyncio.to_thread(
+        record_expense,
+        parsed,
+        ledger=ledger,
+        firefly=client,
+        asset_id=ASSET_ID,
+        currency=CURRENCY,
+    )
 
 
 if __name__ == "__main__":
