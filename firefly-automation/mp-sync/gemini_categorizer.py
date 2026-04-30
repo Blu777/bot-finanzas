@@ -15,25 +15,11 @@ from firefly_client import FireflyClient
 log = logging.getLogger(__name__)
 
 
-SYSTEM_PROMPT = """Sos un clasificador de transacciones financieras en español (Argentina).
-Recibis una lista de transacciones y una lista de categorias existentes.
-Para cada transaccion devolves la categoria que mejor la describa, eligiendo
-SOLO de la lista de categorias provista. Si ninguna categoria encaja con
-seguridad razonable, usa "UNKNOWN".
-
-Reglas:
-- Compras en supermercados (Carrefour, Coto, Disco, Jumbo, Vea, Dia, Walmart, Chango Mas) -> "Supermercado".
-- Pagos SUBE, combustibles (YPF, Shell, Axion), apps de viaje (Uber, Cabify, Didi) -> "Transporte".
-- Apps de delivery (Rappi, PedidosYa, Glovo) -> "Delivery".
-- Compras en Mercado Libre / Amazon / AliExpress -> "Compras online".
-- Restaurantes, cafeterias, bares, fast food -> "Salidas".
-- Suscripciones digitales (Netflix, Spotify, Disney, HBO, YouTube Premium, DLocal) -> "Suscripciones".
-- Servicios publicos (luz, gas, agua, telefono, internet) -> "Servicios publicos".
-- Rendimientos / inversiones / plazos fijos -> "Inversiones".
-- Transferencias enviadas/recibidas P2P -> "Transferencias".
-- Cuotas de credito / prestamos -> "Prestamos".
-
-Devolves un JSON array, un item por transaccion, en el mismo orden recibido."""
+SYSTEM_PROMPT = (
+    "Clasificador de transacciones AR (es). Recibis categorias numeradas y "
+    "descripciones (una por linea con indice). Devolves SOLO un JSON array de "
+    "enteros: el indice de categoria por cada tx en orden, o -1 si ninguna encaja."
+)
 
 
 @dataclass
@@ -63,28 +49,18 @@ class GeminiResult:
 
 
 def _format_tx_for_prompt(t: dict) -> dict:
-    """Extrae los campos relevantes de un grupo de transaccion de Firefly."""
-    g = t["attributes"]
-    j = g["transactions"][0]  # asumimos 1 split (es lo normal en Firefly)
-    return {
-        "id": t["id"],
-        "external_id": j.get("external_id") or "",
-        "date": (j.get("date") or "")[:10],
-        "amount": j.get("amount"),
-        "type": j.get("type"),
-        "description": j.get("description") or "",
-    }
+    """Extrae solo lo necesario de un grupo de Firefly (id + descripcion)."""
+    j = t["attributes"]["transactions"][0]
+    desc = (j.get("description") or "").strip()
+    if len(desc) > 80:
+        desc = desc[:80]
+    return {"id": t["id"], "description": desc}
 
 
 def _build_prompt(txs: list[dict], categories: list[str]) -> str:
-    return (
-        "Categorias disponibles (elegi UNA o 'UNKNOWN'):\n"
-        + "\n".join(f"- {c}" for c in categories)
-        + "\n\nTransacciones:\n"
-        + json.dumps([{"i": t["id"], "desc": t["description"], "amount": t["amount"], "type": t["type"]} for t in txs], ensure_ascii=False)
-        + '\n\nResponde un JSON array con objetos {"i": <id>, "category": <nombre o UNKNOWN>}, '
-        "manteniendo el orden recibido."
-    )
+    cats_block = "\n".join(f"{i}:{c}" for i, c in enumerate(categories))
+    txs_block = "\n".join(f"{i}:{t['description']}" for i, t in enumerate(txs))
+    return f"Categorias:\n{cats_block}\n\nTxs:\n{txs_block}"
 
 
 def categorize_pending(
@@ -92,7 +68,7 @@ def categorize_pending(
     gemini_api_key: str,
     *,
     tag_filter: str = "mercadopago",
-    model: str = "gemini-2.0-flash",
+    model: str = "gemini-2.5-flash",
     rule_group_id: str | int | None = None,
 ) -> GeminiResult:
     """Busca transacciones taggeadas con `tag_filter` sin categoria y las clasifica con Gemini."""
@@ -115,7 +91,7 @@ def categorize_pending(
         res.details.append("No hay categorias en Firefly. Crear primero.")
         return res
 
-    # 3. llamada a Gemini con structured output (JSON array)
+    # 3. llamada a Gemini: output = array de enteros (indice de categoria, -1 = UNKNOWN)
     g = genai.Client(api_key=gemini_api_key)
     prompt = _build_prompt(txs, cats)
 
@@ -126,6 +102,7 @@ def categorize_pending(
             config=types.GenerateContentConfig(
                 system_instruction=SYSTEM_PROMPT,
                 response_mime_type="application/json",
+                response_schema={"type": "ARRAY", "items": {"type": "INTEGER"}},
                 temperature=0.0,
             ),
         )
@@ -136,20 +113,24 @@ def categorize_pending(
         res.details.append(f"Gemini error: {e}")
         return res
 
-    # 4. mapear y actualizar Firefly
-    by_id = {t["id"]: t for t in txs}
-    cats_lower = {c.lower(): c for c in cats}
+    if not isinstance(data, list) or len(data) != len(txs):
+        log.warning("Respuesta de Gemini con largo inesperado: got=%s expected=%d", data, len(txs))
+        res.errors = len(txs)
+        res.details.append(f"respuesta IA invalida (len={len(data) if isinstance(data, list) else '?'})")
+        return res
 
-    for item in data:
-        tid = str(item.get("i") or item.get("id") or "")
-        cat = (item.get("category") or "").strip()
-        if not tid or tid not in by_id:
-            continue
-        original_desc = by_id[tid]["description"][:50]
+    # 4. mapear indice -> categoria y actualizar Firefly
+    n_cats = len(cats)
+    for tx, idx in zip(txs, data):
+        tid = tx["id"]
+        original_desc = tx["description"][:50]
+        try:
+            idx = int(idx)
+        except (TypeError, ValueError):
+            idx = -1
 
-        if cat == "UNKNOWN" or not cat:
+        if idx < 0 or idx >= n_cats:
             try:
-                # marcar para no reintentar
                 _add_tag(client, tid, "ai-miss")
                 res.unknown += 1
                 res.details.append(f"UNKNOWN: {original_desc}")
@@ -158,14 +139,7 @@ def categorize_pending(
                 res.details.append(f"err tag #{tid}: {e}")
             continue
 
-        # validar que la categoria devuelta exista (case-insensitive)
-        canonical = cats_lower.get(cat.lower())
-        if not canonical:
-            log.warning("LLM devolvio categoria desconocida: %r", cat)
-            res.unknown += 1
-            res.details.append(f"cat invalida '{cat}': {original_desc}")
-            continue
-
+        canonical = cats[idx]
         try:
             client.update_transaction_category(tid, canonical)
             _add_tag(client, tid, "ai-classified")

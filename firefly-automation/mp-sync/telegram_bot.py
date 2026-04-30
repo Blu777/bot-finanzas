@@ -49,7 +49,7 @@ ASSET_ID = int(os.environ["FIREFLY_ASSET_ACCOUNT_ID"])
 CURRENCY = os.environ.get("CURRENCY", "ARS")
 RULE_GROUP_TITLE = os.environ.get("RULE_GROUP_TITLE", "mp-bot")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
 
 client = FireflyClient(FIREFLY_URL, FIREFLY_TOKEN)

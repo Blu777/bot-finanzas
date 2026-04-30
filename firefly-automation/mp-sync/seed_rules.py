@@ -82,6 +82,11 @@ SEED: list[tuple[str, str]] = [
     # Pagos / creditos
     ("creditos de mercado pago", "Prestamos"),
     ("pago de cuota", "Prestamos"),
+    # Movimientos internos MP (saldo reservado <-> disponible)
+    ("dinero reservado", "Movimientos internos"),
+    ("dinero retirado", "Movimientos internos"),
+    ("dinero devuelto", "Movimientos internos"),
+    ("dinero disponible", "Movimientos internos"),
 ]
 
 

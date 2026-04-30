@@ -36,4 +36,4 @@ services:
       # --- Gemini (categorizacion automatica con IA) ---
       # API key: https://aistudio.google.com/app/apikey  (free tier 1M tok/dia)
       GEMINI_API_KEY: "REPLACE_ME_GEMINI_API_KEY"
-      GEMINI_MODEL: gemini-2.0-flash
+      GEMINI_MODEL: gemini-2.5-flash
