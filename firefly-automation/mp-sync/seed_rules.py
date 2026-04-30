@@ -87,6 +87,9 @@ SEED: list[tuple[str, str]] = [
     ("dinero retirado", "Movimientos internos"),
     ("dinero devuelto", "Movimientos internos"),
     ("dinero disponible", "Movimientos internos"),
+    # Overrides de personas conocidas (deben ir DESPUES de "transferencia ..."
+    # para que set_category sobreescriba al de Transferencias).
+    ("paloma", "Supermercado"),  # super chino del barrio
 ]
 
 
