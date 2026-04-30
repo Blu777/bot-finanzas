@@ -3,7 +3,7 @@ from __future__ import annotations
 from google.genai import types
 
 
-DEFAULT_GEMINI_MODEL = "gemini-3.1-flash-lite-preview"
+DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
 
 
 def low_latency_config(
