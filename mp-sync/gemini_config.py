@@ -33,4 +33,4 @@ def _supports_thinking_level(model: str) -> bool:
 
 
 def _supports_thinking_budget(model: str) -> bool:
-    return "gemini-2.5-flash" in model.lower()
+    return model.lower().startswith("gemini-2.5-flash")

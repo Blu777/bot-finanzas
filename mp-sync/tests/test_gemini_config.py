@@ -46,3 +46,14 @@ def test_low_latency_config_skips_unsupported_thinking_budget():
     )
 
     assert config.thinking_config is None
+
+
+def test_supports_thinking_budget_rejects_non_prefix_match():
+    """Ensure substring-only matches (e.g. 'not-gemini-2.5-flash') are rejected."""
+    config = low_latency_config(
+        model="not-gemini-2.5-flash",
+        system_instruction="system",
+        response_schema={"type": "OBJECT"},
+    )
+
+    assert config.thinking_config is None
