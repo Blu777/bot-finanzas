@@ -7,6 +7,9 @@ Comandos:
 - /reglas             - lista reglas creadas por el bot
 - /aprender <kw> => <cat>  - crea regla "description contiene <kw> -> categoria <cat>"
 - /borrar_regla <id>  - borra una regla por id
+- /estado             - muestra salud/configuracion basica
+- /ultimos [n]        - ultimos gastos del ledger
+- /buscar <texto>     - busca en el ledger local
 - (adjuntar CSV)      - importa el CSV
 """
 from __future__ import annotations
@@ -69,17 +72,35 @@ HELP = (
     "  /categorizar                       - corre Gemini sobre tx pendientes\n"
     "  /aplicar_reglas                    - reaplica reglas a tx existentes\n"
     "  /deshacer                         - borra la ultima entrada del ledger y de Firefly\n"
+    "  /estado                           - salud basica del bot\n"
+    "  /ultimos [n]                      - ultimas entradas del ledger local\n"
+    "  /buscar <texto>                   - busca en el ledger local\n"
     "\n"
-    "Adjunta un CSV de Mercado Pago (Date,Description,Amount,External_ID) "
+    "Adjunta un CSV de Mercado Pago (statement o Date,Description,Amount,External_ID) "
     "y lo importo a Firefly.\n"
     "\n"
     "Tambien podes escribir texto libre para registrar un gasto rapido:\n"
     "  '7000 chino'           -> Supermercado 7000 ARS hoy\n"
     "  'ayer 15 lucas nafta'  -> Transporte 15000 ARS ayer\n"
     "  '+50k sueldo'          -> Ingreso 50000 ARS hoy\n"
-    "El bot primero consulta el CSV local (/data/ledger.csv). Si ya existe una "
-    "entrada manual con el mismo monto y fecha, respeta la descripcion del CSV."
+    "El bot primero consulta el ledger SQLite local. Si ya existe una "
+    "entrada manual con el mismo monto y fecha, respeta esa descripcion."
 )
+
+
+def _format_ledger_rows(rows) -> str:
+    if not rows:
+        return "Sin resultados."
+    lines = []
+    for r in rows:
+        sign = "-" if r.amount < 0 else "+"
+        cat = r.category or "sin categoria"
+        firefly = f" ff#{r.firefly_id}" if r.firefly_id else ""
+        lines.append(
+            f"#{r._row_index} {r.date} {sign}${abs(r.amount):.2f} "
+            f"{r.description} [{cat}]{firefly}"
+        )
+    return "\n".join(lines)
 
 
 def _is_allowed(update: Update) -> bool:
@@ -206,6 +227,56 @@ async def cmd_borrar_regla(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await update.message.reply_text(f"Regla #{rid} borrada.")
 
 
+async def cmd_estado(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _guard(update):
+        return
+    stats = await asyncio.to_thread(ledger.stats)
+    firefly_ok = "OK"
+    try:
+        await asyncio.to_thread(client.list_categories)
+    except Exception as e:
+        firefly_ok = f"ERROR: {e}"
+
+    lines = [
+        "Estado:",
+        f"- Firefly: {firefly_ok}",
+        f"- Gemini: {'configurado' if GEMINI_API_KEY else 'sin GEMINI_API_KEY'}",
+        f"- Ledger: {ledger.path}",
+        f"- Entradas NL/manuales: {stats['entries']}",
+        f"- Pendientes sin Firefly ID: {stats['unsynced']}",
+        f"- Imports registrados: {stats['imports']}",
+        f"- Filas de import con error: {stats['import_errors']}",
+    ]
+    await update.message.reply_text("\n".join(lines))
+
+
+async def cmd_ultimos(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _guard(update):
+        return
+    limit = 5
+    if context.args:
+        try:
+            limit = int(context.args[0])
+        except ValueError:
+            await update.message.reply_text("Uso: /ultimos [cantidad]")
+            return
+    rows = await asyncio.to_thread(ledger.recent_entries, limit)
+    await update.message.reply_text(_format_ledger_rows(rows))
+
+
+async def cmd_buscar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _guard(update):
+        return
+    term = " ".join(context.args or []).strip()
+    if not term:
+        await update.message.reply_text("Uso: /buscar <texto>")
+        return
+    rows = await asyncio.to_thread(ledger.search_entries, term, 10)
+    if len(rows) < 10:
+        rows.extend(await asyncio.to_thread(ledger.search_import_rows, term, 10 - len(rows)))
+    await update.message.reply_text(_format_ledger_rows(rows))
+
+
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _guard(update):
         return
@@ -236,6 +307,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 client=client,
                 asset_id=ASSET_ID,
                 currency=CURRENCY,
+                ledger=ledger,
             )
         except ValueError as e:
             await msg.reply_text(f"CSV invalido: {e}")
@@ -246,6 +318,12 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
 
     summary = result.summary()
+    await asyncio.to_thread(
+        ledger.record_operation,
+        "import_csv",
+        status="ok" if result.errors == 0 else "partial",
+        message=summary,
+    )
     log.info("Resultado:\n%s", summary)
     await msg.reply_text(f"```\n{summary}\n```", parse_mode="Markdown")
 
@@ -351,6 +429,13 @@ async def handle_other(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             asset_id=ASSET_ID,
             currency=CURRENCY,
         )
+        await asyncio.to_thread(
+            ledger.record_operation,
+            result.action,
+            row=result.row,
+            status="ok",
+            message=result.message,
+        )
     except FireflyError as e:
         await update.message.reply_text(f"Firefly error: {e}")
         return
@@ -382,6 +467,13 @@ async def cmd_deshacer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             parts.append(f"Error: {e}")
     else:
         parts.append("No estaba sincronizado con Firefly.")
+    await asyncio.to_thread(
+        ledger.record_operation,
+        "undo",
+        row=removed,
+        status="ok",
+        message="\n".join(parts),
+    )
     await update.message.reply_text("\n".join(parts))
 
 
@@ -396,6 +488,9 @@ def main() -> None:
     app.add_handler(CommandHandler("categorizar", cmd_categorizar))
     app.add_handler(CommandHandler("aplicar_reglas", cmd_aplicar_reglas))
     app.add_handler(CommandHandler("deshacer", cmd_deshacer))
+    app.add_handler(CommandHandler("estado", cmd_estado))
+    app.add_handler(CommandHandler("ultimos", cmd_ultimos))
+    app.add_handler(CommandHandler("buscar", cmd_buscar))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_other))
 

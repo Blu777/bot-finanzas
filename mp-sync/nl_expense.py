@@ -131,6 +131,12 @@ class LedgerRow:
     _row_index: int = -1         # id interno en SQLite
 
 
+@dataclass
+class ImportBatch:
+    id: int
+    filename: str
+
+
 class Ledger:
     """SQLite local como fuente de verdad manual.
 
@@ -184,6 +190,76 @@ class Ledger:
                 ON ledger_entries(amount, date)
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS ledger_operations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    operation_type TEXT NOT NULL,
+                    ledger_entry_id INTEGER,
+                    external_id TEXT NOT NULL DEFAULT '',
+                    description TEXT NOT NULL DEFAULT '',
+                    amount REAL,
+                    status TEXT NOT NULL DEFAULT 'ok',
+                    message TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_operations_created_at
+                ON ledger_operations(created_at)
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS import_batches (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    filename TEXT NOT NULL,
+                    source_format TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'processing',
+                    total INTEGER NOT NULL DEFAULT 0,
+                    created INTEGER NOT NULL DEFAULT 0,
+                    skipped INTEGER NOT NULL DEFAULT 0,
+                    errors INTEGER NOT NULL DEFAULT 0,
+                    started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    finished_at TEXT
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS import_rows (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    import_id INTEGER NOT NULL,
+                    row_no INTEGER NOT NULL,
+                    external_id TEXT NOT NULL DEFAULT '',
+                    date TEXT NOT NULL DEFAULT '',
+                    description TEXT NOT NULL DEFAULT '',
+                    amount REAL NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL,
+                    error TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(import_id) REFERENCES import_batches(id)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_import_rows_external_id
+                ON import_rows(external_id)
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS category_overrides (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    pattern TEXT NOT NULL UNIQUE,
+                    category TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
 
     def _migrate_legacy_csv(self) -> None:
         if self.legacy_csv_path is None or not self.legacy_csv_path.exists():
@@ -220,6 +296,183 @@ class Ledger:
                     rows,
                 )
                 log.info("Migradas %d filas de %s a %s", len(rows), self.legacy_csv_path, self.path)
+
+    def stats(self) -> dict[str, int]:
+        with self._db() as conn:
+            entry_count = conn.execute("SELECT COUNT(*) FROM ledger_entries").fetchone()[0]
+            unsynced = conn.execute(
+                "SELECT COUNT(*) FROM ledger_entries WHERE firefly_id = ''"
+            ).fetchone()[0]
+            import_count = conn.execute("SELECT COUNT(*) FROM import_batches").fetchone()[0]
+            import_errors = conn.execute(
+                "SELECT COUNT(*) FROM import_rows WHERE status = 'error'"
+            ).fetchone()[0]
+            return {
+                "entries": int(entry_count),
+                "unsynced": int(unsynced),
+                "imports": int(import_count),
+                "import_errors": int(import_errors),
+            }
+
+    def recent_entries(self, limit: int = 5) -> list[LedgerRow]:
+        with self._db() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, date, description, amount, category, source, firefly_id
+                FROM ledger_entries
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (max(1, min(limit, 20)),),
+            ).fetchall()
+        return [
+            LedgerRow(
+                date=(row["date"] or "").strip(),
+                description=(row["description"] or "").strip(),
+                amount=float(row["amount"] or 0),
+                category=(row["category"] or "").strip(),
+                source=(row["source"] or "manual").strip(),
+                firefly_id=(row["firefly_id"] or "").strip(),
+                _row_index=int(row["id"]),
+            )
+            for row in rows
+        ]
+
+    def search_entries(self, term: str, limit: int = 10) -> list[LedgerRow]:
+        needle = f"%{term.strip()}%"
+        with self._db() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, date, description, amount, category, source, firefly_id
+                FROM ledger_entries
+                WHERE description LIKE ? OR category LIKE ? OR firefly_id LIKE ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (needle, needle, needle, max(1, min(limit, 30))),
+            ).fetchall()
+        return [
+            LedgerRow(
+                date=(row["date"] or "").strip(),
+                description=(row["description"] or "").strip(),
+                amount=float(row["amount"] or 0),
+                category=(row["category"] or "").strip(),
+                source=(row["source"] or "manual").strip(),
+                firefly_id=(row["firefly_id"] or "").strip(),
+                _row_index=int(row["id"]),
+            )
+            for row in rows
+        ]
+
+    def search_import_rows(self, term: str, limit: int = 10) -> list[LedgerRow]:
+        needle = f"%{term.strip()}%"
+        with self._db() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, date, description, amount, external_id, status
+                FROM import_rows
+                WHERE description LIKE ? OR external_id LIKE ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (needle, needle, max(1, min(limit, 30))),
+            ).fetchall()
+        return [
+            LedgerRow(
+                date=(row["date"] or "").strip(),
+                description=(row["description"] or "").strip(),
+                amount=float(row["amount"] or 0),
+                category=(row["status"] or "import").strip(),
+                source="import",
+                firefly_id=(row["external_id"] or "").strip(),
+                _row_index=int(row["id"]),
+            )
+            for row in rows
+        ]
+
+    def create_import(self, filename: str, source_format: str = "") -> ImportBatch:
+        with self._db() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO import_batches (filename, source_format)
+                VALUES (?, ?)
+                """,
+                (filename, source_format),
+            )
+            return ImportBatch(id=int(cur.lastrowid), filename=filename)
+
+    def finish_import(self, import_id: int, *, total: int, created: int, skipped: int, errors: int) -> None:
+        status = "error" if errors and not created else "partial" if errors else "ok"
+        with self._db() as conn:
+            conn.execute(
+                """
+                UPDATE import_batches
+                SET status = ?, total = ?, created = ?, skipped = ?, errors = ?,
+                    finished_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (status, total, created, skipped, errors, import_id),
+            )
+
+    def record_import_row(
+        self,
+        import_id: int,
+        row_no: int,
+        row: dict,
+        *,
+        status: str,
+        error: str = "",
+    ) -> None:
+        amount = 0.0
+        try:
+            amount = float(row.get("Amount") or 0)
+        except (TypeError, ValueError):
+            amount = 0.0
+        with self._db() as conn:
+            conn.execute(
+                """
+                INSERT INTO import_rows
+                (import_id, row_no, external_id, date, description, amount, status, error)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    import_id,
+                    row_no,
+                    (row.get("External_ID") or "").strip(),
+                    (row.get("Date") or "").strip(),
+                    (row.get("Description") or "").strip(),
+                    amount,
+                    status,
+                    error[:500],
+                ),
+            )
+
+    def record_operation(
+        self,
+        operation_type: str,
+        *,
+        row: LedgerRow | None = None,
+        external_id: str = "",
+        status: str = "ok",
+        message: str = "",
+    ) -> None:
+        with self._db() as conn:
+            conn.execute(
+                """
+                INSERT INTO ledger_operations
+                (operation_type, ledger_entry_id, external_id, description, amount, status, message)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    operation_type,
+                    row._row_index if row else None,
+                    external_id,
+                    row.description if row else "",
+                    float(row.amount) if row else None,
+                    status,
+                    message[:500],
+                ),
+            )
 
     def _read_all(self) -> list[LedgerRow]:
         out: list[LedgerRow] = []
