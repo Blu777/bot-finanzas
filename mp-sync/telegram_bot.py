@@ -35,6 +35,7 @@ from telegram.ext import (
 
 from firefly_client import FireflyClient, FireflyError
 from firefly_import import import_csv_file
+from gemini_config import DEFAULT_GEMINI_MODEL
 from gemini_categorizer import categorize_pending
 from nl_expense import Ledger, parse_expense, record_expense
 
@@ -58,7 +59,7 @@ ASSET_ID = int(os.environ["FIREFLY_ASSET_ACCOUNT_ID"])
 CURRENCY = os.environ.get("CURRENCY", "ARS")
 RULE_GROUP_TITLE = os.environ.get("RULE_GROUP_TITLE", "mp-bot")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-lite")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", DEFAULT_GEMINI_MODEL)
 LOCAL_LEDGER_CSV = os.environ.get("LOCAL_LEDGER_CSV", "/data/ledger.csv")
 
 
