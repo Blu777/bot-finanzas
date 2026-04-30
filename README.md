@@ -47,6 +47,9 @@ docker build -t mp-sync:local /mnt/HMS/appdata/firefly/stack/mp-sync
 
 (Re-ejecutar cuando se modifique `telegram_bot.py` o `requirements.txt`.)
 
+**Seguridad**: `TELEGRAM_ALLOWED_CHATS` vacio bloquea todos los comandos salvo `/id`.
+Corre `/id` al primer arranque, anota el chat_id, y setealo en el compose.
+
 ### 3. Subir credentials.json
 
 Desde la PC:

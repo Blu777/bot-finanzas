@@ -83,9 +83,9 @@ HELP = (
 
 
 def _is_allowed(update: Update) -> bool:
-    if not ALLOWED_CHATS:
-        return True
     chat_id = update.effective_chat.id if update.effective_chat else None
+    if not ALLOWED_CHATS:
+        return False
     return chat_id in ALLOWED_CHATS
 
 
@@ -399,7 +399,7 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_other))
 
-    log.info("Bot iniciado. Chats autorizados: %s", ALLOWED_CHATS or "(abierto)")
+    log.info("Bot iniciado. Chats autorizados: %s", ALLOWED_CHATS or "(bloqueado - configurar ALLOWED_CHATS)")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 

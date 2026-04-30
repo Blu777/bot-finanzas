@@ -24,7 +24,7 @@ services:
       # --- Telegram ---
       TELEGRAM_BOT_TOKEN: "REPLACE_ME_TG_TOKEN"
       # Chat ids autorizados (los obtenes mandandole /id al bot apenas arranca).
-      # Mientras este vacio, el bot acepta a CUALQUIERA -> usar solo para el primer arranque.
+      # Vacio = bot rechaza todo salvo /id. SIEMPRE setear esto antes de usar.
       TELEGRAM_ALLOWED_CHATS: ""
 
       # --- Firefly III ---
