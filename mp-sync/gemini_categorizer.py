@@ -8,9 +8,9 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from google import genai
-from google.genai import types
 
 from firefly_client import FireflyClient
+from gemini_config import low_latency_config
 from retry_utils import call_with_retries
 
 
@@ -132,11 +132,10 @@ def categorize_pending(
             lambda: g.models.generate_content(
                 model=model,
                 contents=prompt,
-                config=types.GenerateContentConfig(
+                config=low_latency_config(
+                    model=model,
                     system_instruction=SYSTEM_PROMPT,
-                    response_mime_type="application/json",
                     response_schema={"type": "ARRAY", "items": {"type": "STRING"}},
-                    temperature=0.0,
                 ),
             ),
             attempts=3,
