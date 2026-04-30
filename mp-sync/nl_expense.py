@@ -14,6 +14,7 @@ import csv
 import json
 import logging
 import sqlite3
+import unicodedata
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -136,6 +137,49 @@ class LedgerRow:
 class ImportBatch:
     id: int
     filename: str
+
+
+def _strip_accents(s: str) -> str:
+    return "".join(
+        c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn"
+    )
+
+
+_FILLER = frozenset({
+    "transferencia", "transferida", "recibida", "enviada",
+    "pago", "compra", "venta", "cobro", "devolucion",
+    "credito", "creditos", "debito", "cuota",
+    "de", "del", "la", "el", "los", "las",
+    "a", "al", "en", "por", "con", "para", "sin",
+    "una", "uno", "un", "su", "mi",
+})
+
+
+def _descriptions_compatible(a: str, b: str) -> bool:
+    """Return True if two descriptions are similar enough to be the same tx.
+
+    Strips accents, lowercases, and ignores common financial filler words so
+    that the comparison focuses on the distinguishing parts (names, stores).
+    """
+    a_norm = _strip_accents(a.strip().lower())
+    b_norm = _strip_accents(b.strip().lower())
+    if not a_norm or not b_norm:
+        return True
+    if a_norm == b_norm:
+        return True
+    if a_norm in b_norm or b_norm in a_norm:
+        return True
+    words_a = set(a_norm.split())
+    words_b = set(b_norm.split())
+    sig_a = words_a - _FILLER
+    sig_b = words_b - _FILLER
+    if not sig_a or not sig_b:
+        return True
+    only_a = sig_a - sig_b
+    only_b = sig_b - sig_a
+    if only_a and only_b:
+        return False
+    return True
 
 
 class Ledger:
@@ -500,15 +544,19 @@ class Ledger:
         return out
 
     def find_match(
-        self, amount: float, date_str: str, *, tolerance_days: int = 1
+        self,
+        amount: float,
+        date_str: str,
+        *,
+        tolerance_days: int = 1,
+        description: str = "",
     ) -> LedgerRow | None:
         try:
             target = datetime.strptime(date_str, "%Y-%m-%d").date()
         except ValueError:
             return None
         amt_key = round(amount, 2)
-        best: LedgerRow | None = None
-        best_delta = tolerance_days + 1
+        candidates: list[tuple[int, LedgerRow]] = []
         for r in self._read_all():
             if round(r.amount, 2) != amt_key:
                 continue
@@ -517,10 +565,24 @@ class Ledger:
             except ValueError:
                 continue
             delta = abs((rd - target).days)
-            if delta <= tolerance_days and delta < best_delta:
-                best = r
-                best_delta = delta
-        return best
+            if delta <= tolerance_days:
+                candidates.append((delta, r))
+
+        if not candidates:
+            return None
+
+        if description:
+            compatible = [
+                (d, r) for d, r in candidates
+                if _descriptions_compatible(description, r.description)
+            ]
+            if compatible:
+                candidates = compatible
+            else:
+                return None
+
+        candidates.sort(key=lambda t: t[0])
+        return candidates[0][1]
 
     def append(self, row: LedgerRow) -> int:
         with self._db() as conn:
@@ -620,7 +682,9 @@ def record_expense(
             message="No se reconocio un monto.",
         )
 
-    match = ledger.find_match(parsed.amount, parsed.date, tolerance_days=1)
+    match = ledger.find_match(
+        parsed.amount, parsed.date, tolerance_days=1, description=parsed.description
+    )
 
     if match is not None:
         # Fecha: corregir si difiere (metadato tecnico), contenido intacto.
