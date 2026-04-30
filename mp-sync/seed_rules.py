@@ -55,6 +55,9 @@ SEED: list[tuple[str, str]] = [
     ("dean and dennys", "Salidas"),
     ("stop and coffee", "Salidas"),
     ("havanna", "Salidas"),
+    # Comida trabajo
+    ("hestia", "Comida Trabajo"),
+    ("toldito", "Comida Trabajo"),
     # Servicios / suscripciones
     ("netflix", "Suscripciones"),
     ("spotify", "Suscripciones"),
