@@ -13,6 +13,7 @@ from __future__ import annotations
 import csv
 import json
 import logging
+import re
 import sqlite3
 import unicodedata
 from contextlib import contextmanager
@@ -38,6 +39,10 @@ SYSTEM_PROMPT = (
     "conocidas. Devolves JSON estricto con:\n"
     "- amount: numero SIGNADO. Gasto=NEGATIVO, ingreso=POSITIVO. Si no aclara, "
     "asumi gasto.\n"
+    "- IMPORTANTE: si el usuario pone un signo explicito (- o +) antes del monto, "
+    "RESPETAR ese signo siempre. Ej: '-4000' = -4000, '+4000' = 4000.\n"
+    "- 'devolucion' / 'devolver' = dinero que SALE = NEGATIVO (es un gasto, "
+    "no un ingreso).\n"
     "- description: texto limpio del comercio/concepto (ej: 'Supermercado chino').\n"
     "- category_name: nombre EXACTO de categoria conocida que mejor encaje. "
     "Si ninguna encaja bien, inventa un nombre nuevo corto y descriptivo "
@@ -71,6 +76,33 @@ class ParsedExpense:
     description: str
     category: str   # "" si UNKNOWN
     date: str       # YYYY-MM-DD
+
+
+_EXPLICIT_SIGN_RE = re.compile(
+    r"(?:^|[\s(])"           # start of string or whitespace/paren
+    r"([+-])"                # explicit sign
+    r"\s*"
+    r"(\d[\d.,]*)"           # digits (possibly with . or , separators)
+    r"\s*"
+    r"(?:k|lucas|palo)?"     # optional multiplier
+    r"(?:[\s),;]|$)",        # word boundary
+    re.IGNORECASE,
+)
+
+
+def _enforce_explicit_sign(raw_text: str, llm_amount: float) -> float:
+    """Override LLM amount sign when the user typed an explicit +/- prefix."""
+    if llm_amount == 0:
+        return llm_amount
+    m = _EXPLICIT_SIGN_RE.search(raw_text)
+    if not m:
+        return llm_amount
+    sign_char = m.group(1)
+    if sign_char == "-" and llm_amount > 0:
+        return -llm_amount
+    if sign_char == "+" and llm_amount < 0:
+        return -llm_amount
+    return llm_amount
 
 
 def parse_expense(
@@ -112,6 +144,8 @@ def parse_expense(
     amount = float(data.get("amount") or 0)
     description = (data.get("description") or "").strip() or "Gasto"
     category = (data.get("category_name") or "").strip()
+
+    amount = _enforce_explicit_sign(text, amount)
 
     dstr = (data.get("date") or today.isoformat()).strip()[:10]
     try:
