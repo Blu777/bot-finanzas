@@ -1,7 +1,7 @@
-# firefly-automation / mp-sync
+# mp-sync
 
-Servicio Python que cada hora trae los pagos aprobados de Mercado Pago de las
-ultimas 24hs y los registra en Firefly III + Google Sheets.
+Bot de Telegram que importa CSVs de Mercado Pago a Firefly III, con
+categorización automática vía Gemini.
 
 ## Componentes
 
@@ -11,13 +11,23 @@ ultimas 24hs y los registra en Firefly III + Google Sheets.
 ## Estructura
 
 ```
-firefly-automation/
-├── docker-compose.yml      # YAML para pegar en TrueNAS Custom App
-└── mp-sync/
-    ├── Dockerfile
-    ├── requirements.txt
-    ├── sync.py
-    └── credentials.json    # service account de Google (lo subis vos)
+├── .github/
+│   └── workflows/
+│       └── build.yml       # CI para construir y publicar imagen en GHCR
+├── docker-compose.yml      # YAML para pegar en TrueNAS Custom App (secreto, no commitear)
+├── docker-compose.example.yml
+├── firefly-truenas.yml     # Stack Firefly III + Postgres (secreto, no commitear)
+├── firefly-truenas.example.yml
+├── mp-sync/
+│   ├── Dockerfile
+│   ├── requirements.txt
+│   ├── telegram_bot.py
+│   ├── firefly_client.py
+│   ├── firefly_import.py
+│   ├── gemini_categorizer.py
+│   ├── nl_expense.py
+│   └── seed_rules.py
+└── README.md
 ```
 
 ## Despliegue
@@ -35,7 +45,7 @@ firefly-automation/
 docker build -t mp-sync:local /mnt/HMS/appdata/firefly/stack/mp-sync
 ```
 
-(Re-ejecutar cuando se modifique `sync.py` o `requirements.txt`.)
+(Re-ejecutar cuando se modifique `telegram_bot.py` o `requirements.txt`.)
 
 ### 3. Subir credentials.json
 
@@ -72,7 +82,7 @@ docker logs -f mp_sync
 ## Actualizar el codigo
 
 ```bash
-# 1) editar sync.py o requirements.txt en /mnt/HMS/appdata/firefly/stack/mp-sync/
+# 1) editar telegram_bot.py o requirements.txt en /mnt/HMS/appdata/firefly/stack/mp-sync/
 # 2) rebuild imagen
 docker build -t mp-sync:local /mnt/HMS/appdata/firefly/stack/mp-sync
 # 3) reiniciar la app desde TrueNAS UI (o: docker restart mp_sync)
