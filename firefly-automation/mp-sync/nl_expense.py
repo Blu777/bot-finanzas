@@ -219,6 +219,30 @@ class Ledger:
                 )
         tmp.replace(self.path)
 
+    def delete_last(self) -> LedgerRow | None:
+        """Borra la ultima fila de datos y la devuelve. None si no hay datos."""
+        rows = self._read_all()
+        if not rows:
+            return None
+        removed = rows.pop()
+        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+        with tmp.open("w", encoding="utf-8", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(LEDGER_HEADERS)
+            for r in rows:
+                w.writerow(
+                    [
+                        r.date,
+                        r.description,
+                        f"{r.amount:.2f}",
+                        r.category,
+                        r.source,
+                        r.firefly_id,
+                    ]
+                )
+        tmp.replace(self.path)
+        return removed
+
 
 @dataclass
 class RecordResult:

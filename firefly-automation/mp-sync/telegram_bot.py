@@ -68,6 +68,7 @@ HELP = (
     "  /borrar_regla <id>                 - borra regla por id\n"
     "  /categorizar                       - corre Gemini sobre tx pendientes\n"
     "  /aplicar_reglas                    - reaplica reglas a tx existentes\n"
+    "  /desahacer                         - borra la ultima entrada del ledger y de Firefly\n"
     "\n"
     "Adjunta un CSV de Mercado Pago (Date,Description,Amount,External_ID) "
     "y lo importo a Firefly.\n"
@@ -361,6 +362,29 @@ async def handle_other(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(f"```\n{result.summary()}\n```", parse_mode="Markdown")
 
 
+async def cmd_desahacer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _guard(update):
+        return
+    await update.message.reply_text("Deshaciendo ultima entrada...")
+    removed = ledger.delete_last()
+    if removed is None:
+        await update.message.reply_text("No hay entradas en el ledger.")
+        return
+    parts = [f"Borrado del ledger: {removed.date} {removed.description} ${removed.amount:.2f}"]
+    if removed.firefly_id:
+        try:
+            await asyncio.to_thread(client.delete_transaction, int(removed.firefly_id))
+            parts.append(f"Borrado de Firefly: tx #{removed.firefly_id}")
+        except FireflyError as e:
+            parts.append(f"Firefly error borrando tx #{removed.firefly_id}: {e}")
+        except Exception as e:
+            log.exception("Error borrando tx %s", removed.firefly_id)
+            parts.append(f"Error: {e}")
+    else:
+        parts.append("No estaba sincronizado con Firefly.")
+    await update.message.reply_text("\n".join(parts))
+
+
 def main() -> None:
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler(["start", "help"], cmd_start))
@@ -371,6 +395,7 @@ def main() -> None:
     app.add_handler(CommandHandler("borrar_regla", cmd_borrar_regla))
     app.add_handler(CommandHandler("categorizar", cmd_categorizar))
     app.add_handler(CommandHandler("aplicar_reglas", cmd_aplicar_reglas))
+    app.add_handler(CommandHandler("desahacer", cmd_desahacer))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_other))
 

@@ -78,6 +78,9 @@ class FireflyClient:
     def create_transaction(self, payload: dict) -> dict:
         return self._post("/api/v1/transactions", payload)
 
+    def delete_transaction(self, group_id: str | int) -> None:
+        self._delete(f"/api/v1/transactions/{group_id}")
+
     def search_transactions(self, query: str, limit: int = 200) -> list[dict]:
         """Devuelve transacciones que matcheen la query de busqueda."""
         out: list[dict] = []
