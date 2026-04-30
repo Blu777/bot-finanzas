@@ -68,7 +68,7 @@ HELP = (
     "  /borrar_regla <id>                 - borra regla por id\n"
     "  /categorizar                       - corre Gemini sobre tx pendientes\n"
     "  /aplicar_reglas                    - reaplica reglas a tx existentes\n"
-    "  /desahacer                         - borra la ultima entrada del ledger y de Firefly\n"
+    "  /deshacer                         - borra la ultima entrada del ledger y de Firefly\n"
     "\n"
     "Adjunta un CSV de Mercado Pago (Date,Description,Amount,External_ID) "
     "y lo importo a Firefly.\n"
@@ -362,7 +362,7 @@ async def handle_other(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(f"```\n{result.summary()}\n```", parse_mode="Markdown")
 
 
-async def cmd_desahacer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_deshacer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _guard(update):
         return
     await update.message.reply_text("Deshaciendo ultima entrada...")
@@ -395,7 +395,7 @@ def main() -> None:
     app.add_handler(CommandHandler("borrar_regla", cmd_borrar_regla))
     app.add_handler(CommandHandler("categorizar", cmd_categorizar))
     app.add_handler(CommandHandler("aplicar_reglas", cmd_aplicar_reglas))
-    app.add_handler(CommandHandler("desahacer", cmd_desahacer))
+    app.add_handler(CommandHandler("deshacer", cmd_deshacer))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_other))
 
