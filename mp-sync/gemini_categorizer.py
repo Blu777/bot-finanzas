@@ -158,7 +158,7 @@ def categorize_pending(
         return res
 
     # 4. mapear nombre -> categoria y actualizar Firefly
-    cats_lower = {c.lower() for c in cats}
+    cats_map = {c.lower(): c for c in cats}
     for tx, cat_name in zip(txs, data):
         tid = tx["id"]
         original_desc = tx["description"][:50]
@@ -174,7 +174,7 @@ def categorize_pending(
                 res.details.append(f"err tag #{tid}: {e}")
             continue
 
-        if canonical.lower() not in cats_lower:
+        if canonical.lower() not in cats_map:
             try:
                 _add_tag(client, tid, "ai-miss")
                 res.unknown += 1
@@ -187,10 +187,11 @@ def categorize_pending(
             continue
 
         try:
-            client.update_transaction_category(tid, canonical)
+            firefly_cat = cats_map[canonical.lower()]
+            client.update_transaction_category(tid, firefly_cat)
             _add_tag(client, tid, "ai-classified")
             res.classified += 1
-            log.info("  + #%s '%s' -> %s", tid, original_desc, canonical)
+            log.info("  + #%s '%s' -> %s", tid, original_desc, firefly_cat)
         except Exception as e:
             res.errors += 1
             res.details.append(f"err update #{tid}: {e}")
