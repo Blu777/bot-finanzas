@@ -30,6 +30,7 @@ from telegram.ext import (
 from firefly_client import FireflyClient, FireflyError
 from firefly_import import import_csv_file
 from gemini_categorizer import categorize_pending
+from nl_expense import Ledger, parse_expense, record_expense
 
 
 logging.basicConfig(
@@ -50,9 +51,11 @@ CURRENCY = os.environ.get("CURRENCY", "ARS")
 RULE_GROUP_TITLE = os.environ.get("RULE_GROUP_TITLE", "mp-bot")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+LOCAL_LEDGER_CSV = os.environ.get("LOCAL_LEDGER_CSV", "/data/ledger.csv")
 
 
 client = FireflyClient(FIREFLY_URL, FIREFLY_TOKEN)
+ledger = Ledger(LOCAL_LEDGER_CSV)
 
 
 HELP = (
@@ -67,8 +70,14 @@ HELP = (
     "  /aplicar_reglas                    - reaplica reglas a tx existentes\n"
     "\n"
     "Adjunta un CSV de Mercado Pago (Date,Description,Amount,External_ID) "
-    "y lo importo a Firefly. Despues del import corro Gemini automaticamente "
-    "sobre las que quedaron sin categoria."
+    "y lo importo a Firefly.\n"
+    "\n"
+    "Tambien podes escribir texto libre para registrar un gasto rapido:\n"
+    "  '7000 chino'           -> Supermercado 7000 ARS hoy\n"
+    "  'ayer 15 lucas nafta'  -> Transporte 15000 ARS ayer\n"
+    "  '+50k sueldo'          -> Ingreso 50000 ARS hoy\n"
+    "El bot primero consulta el CSV local (/data/ledger.csv). Si ya existe una "
+    "entrada manual con el mismo monto y fecha, respeta la descripcion del CSV."
 )
 
 
@@ -295,9 +304,61 @@ async def cmd_aplicar_reglas(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def handle_other(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Texto libre -> extraer gasto via LLM + sync con ledger + Firefly."""
     if not await _guard(update):
         return
-    await update.message.reply_text("Adjunta un CSV o usa /help.")
+    text = (update.message.text or "").strip()
+    if not text:
+        return
+    if not GEMINI_API_KEY:
+        await update.message.reply_text(
+            "GEMINI_API_KEY no configurada. Usa /help para ver comandos."
+        )
+        return
+
+    await context.bot.send_chat_action(
+        chat_id=update.message.chat_id, action=ChatAction.TYPING
+    )
+
+    try:
+        cats_raw = await asyncio.to_thread(client.list_categories)
+        cats = [c["attributes"]["name"] for c in cats_raw]
+        if not cats:
+            await update.message.reply_text(
+                "No hay categorias en Firefly. Corre /aprender o el seeder primero."
+            )
+            return
+
+        parsed = await asyncio.to_thread(
+            parse_expense,
+            text,
+            gemini_api_key=GEMINI_API_KEY,
+            model=GEMINI_MODEL,
+            categories=cats,
+        )
+        if parsed.amount == 0:
+            await update.message.reply_text(
+                "No detecte un monto. Ej: '7000 chino' o 'ayer 15k nafta'."
+            )
+            return
+
+        result = await asyncio.to_thread(
+            record_expense,
+            parsed,
+            ledger=ledger,
+            firefly=client,
+            asset_id=ASSET_ID,
+            currency=CURRENCY,
+        )
+    except FireflyError as e:
+        await update.message.reply_text(f"Firefly error: {e}")
+        return
+    except Exception as e:
+        log.exception("NL expense fallo")
+        await update.message.reply_text(f"Error: {e}")
+        return
+
+    await update.message.reply_text(f"```\n{result.summary()}\n```", parse_mode="Markdown")
 
 
 def main() -> None:

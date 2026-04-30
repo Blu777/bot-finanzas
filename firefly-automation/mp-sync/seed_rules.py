@@ -90,6 +90,7 @@ SEED: list[tuple[str, str]] = [
     # Overrides de personas conocidas (deben ir DESPUES de "transferencia ..."
     # para que set_category sobreescriba al de Transferencias).
     ("paloma", "Supermercado"),  # super chino del barrio
+    ("tina pulvirenti", "Alquiler+Expensas"),
 ]
 
 
