@@ -47,7 +47,7 @@ logging.basicConfig(
 log = logging.getLogger("mp-bot")
 
 
-BOT_VERSION = "1.2"
+BOT_VERSION = "1.3"
 
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ALLOWED_CHATS = {
