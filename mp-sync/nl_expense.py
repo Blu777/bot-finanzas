@@ -22,9 +22,9 @@ from datetime import date, datetime
 from pathlib import Path
 
 from google import genai
-from google.genai import types
 
 from firefly_client import FireflyClient
+from gemini_config import low_latency_config
 from retry_utils import call_with_retries
 
 
@@ -127,11 +127,10 @@ def parse_expense(
         lambda: client.models.generate_content(
             model=model,
             contents=prompt,
-            config=types.GenerateContentConfig(
+            config=low_latency_config(
+                model=model,
                 system_instruction=SYSTEM_PROMPT,
-                response_mime_type="application/json",
                 response_schema=RESPONSE_SCHEMA,
-                temperature=0.0,
             ),
         ),
         attempts=3,

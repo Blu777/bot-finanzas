@@ -2,6 +2,7 @@ mp-sync/credentials.json
 mp-sync/logs/
 __pycache__/
 *.pyc
+.venv/
 
 # Composes con secretos reales (NO subir a GitHub).
 docker-compose.yml

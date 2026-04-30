@@ -46,7 +46,7 @@ logging.basicConfig(
 log = logging.getLogger("mp-bot")
 
 
-BOT_VERSION = "1.1"
+BOT_VERSION = "1.2"
 
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ALLOWED_CHATS = {
@@ -58,7 +58,7 @@ ASSET_ID = int(os.environ["FIREFLY_ASSET_ACCOUNT_ID"])
 CURRENCY = os.environ.get("CURRENCY", "ARS")
 RULE_GROUP_TITLE = os.environ.get("RULE_GROUP_TITLE", "mp-bot")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-lite")
 LOCAL_LEDGER_CSV = os.environ.get("LOCAL_LEDGER_CSV", "/data/ledger.csv")
 
 
@@ -401,6 +401,7 @@ async def handle_other(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         return
 
+    await update.message.reply_text("Sumando cosas...")
     await context.bot.send_chat_action(
         chat_id=update.message.chat_id, action=ChatAction.TYPING
     )
