@@ -10,6 +10,7 @@ from google import genai
 from google.genai import types
 
 from firefly_client import FireflyClient
+from retry_utils import call_with_retries
 
 
 log = logging.getLogger(__name__)
@@ -96,15 +97,21 @@ def categorize_pending(
     prompt = _build_prompt(txs, cats)
 
     try:
-        response = g.models.generate_content(
-            model=model,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_PROMPT,
-                response_mime_type="application/json",
-                response_schema={"type": "ARRAY", "items": {"type": "INTEGER"}},
-                temperature=0.0,
+        response = call_with_retries(
+            lambda: g.models.generate_content(
+                model=model,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=SYSTEM_PROMPT,
+                    response_mime_type="application/json",
+                    response_schema={"type": "ARRAY", "items": {"type": "INTEGER"}},
+                    temperature=0.0,
+                ),
             ),
+            attempts=3,
+            base_delay=1.0,
+            log=log,
+            label="Gemini categorize",
         )
         data = json.loads(response.text)
     except Exception as e:
@@ -167,13 +174,12 @@ def _add_tag(client: FireflyClient, group_id: str, tag: str) -> None:
         })
     if not new_txs:
         return
-    import requests as _r
     payload = {"apply_rules": False, "fire_webhooks": False, "transactions": new_txs}
-    r = _r.put(
-        f"{client.base}/api/v1/transactions/{group_id}",
+    r = client._request(
+        "PUT",
+        f"/api/v1/transactions/{group_id}",
         headers=client._h(content_type=True),
         json=payload,
-        timeout=client.timeout,
     )
     if r.status_code >= 300:
         raise RuntimeError(f"PUT tag -> {r.status_code}: {r.text[:200]}")

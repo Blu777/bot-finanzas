@@ -5,6 +5,8 @@ import logging
 from typing import Iterable
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 
 log = logging.getLogger(__name__)
@@ -15,10 +17,26 @@ class FireflyError(RuntimeError):
 
 
 class FireflyClient:
-    def __init__(self, base_url: str, token: str, timeout: int = 20):
+    def __init__(self, base_url: str, token: str, timeout: int = 20, retries: int = 3):
         self.base = base_url.rstrip("/")
         self.token = token
         self.timeout = timeout
+        self.session = requests.Session()
+        retry = Retry(
+            total=retries,
+            connect=retries,
+            read=retries,
+            status=retries,
+            backoff_factor=0.8,
+            status_forcelist=(429, 500, 502, 503, 504),
+            # Do not retry POST automatically: a timeout after Firefly accepted a
+            # transaction could duplicate money movement.
+            allowed_methods=frozenset({"GET", "PUT", "DELETE"}),
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retry)
+        self.session.mount("http://", adapter)
+        self.session.mount("https://", adapter)
 
     # ---------- helpers ----------
     def _h(self, content_type: bool = False) -> dict[str, str]:
@@ -30,22 +48,27 @@ class FireflyClient:
             h["Content-Type"] = "application/json"
         return h
 
+    def _request(self, method: str, path: str, **kwargs) -> requests.Response:
+        timeout = kwargs.pop("timeout", self.timeout)
+        try:
+            return self.session.request(method, f"{self.base}{path}", timeout=timeout, **kwargs)
+        except requests.RequestException as exc:
+            raise FireflyError(f"{method.upper()} {path} fallo tras retries: {exc}") from exc
+
     def _get(self, path: str, params: dict | None = None) -> dict:
-        r = requests.get(f"{self.base}{path}", headers=self._h(), params=params, timeout=self.timeout)
+        r = self._request("GET", path, headers=self._h(), params=params)
         if r.status_code >= 300:
             raise FireflyError(f"GET {path} -> {r.status_code}: {r.text[:300]}")
         return r.json()
 
     def _post(self, path: str, payload: dict) -> dict:
-        r = requests.post(
-            f"{self.base}{path}", headers=self._h(content_type=True), json=payload, timeout=self.timeout
-        )
+        r = self._request("POST", path, headers=self._h(content_type=True), json=payload)
         if r.status_code >= 300:
             raise FireflyError(f"POST {path} -> {r.status_code}: {r.text[:400]}")
         return r.json()
 
     def _delete(self, path: str) -> None:
-        r = requests.delete(f"{self.base}{path}", headers=self._h(), timeout=self.timeout)
+        r = self._request("DELETE", path, headers=self._h())
         if r.status_code not in (200, 204):
             raise FireflyError(f"DELETE {path} -> {r.status_code}: {r.text[:300]}")
 
@@ -65,11 +88,11 @@ class FireflyClient:
     # ---------- transactions ----------
     def transaction_exists(self, external_id: str) -> bool:
         # /api/v1/search/transactions usa accept: application/json (no api+json)
-        r = requests.get(
-            f"{self.base}/api/v1/search/transactions",
+        r = self._request(
+            "GET",
+            "/api/v1/search/transactions",
             headers={"Authorization": f"Bearer {self.token}", "Accept": "application/json"},
             params={"query": f"external_id:{external_id}"},
-            timeout=self.timeout,
         )
         if r.status_code != 200:
             return False
@@ -86,11 +109,11 @@ class FireflyClient:
         out: list[dict] = []
         page = 1
         while True:
-            r = requests.get(
-                f"{self.base}/api/v1/search/transactions",
+            r = self._request(
+                "GET",
+                "/api/v1/search/transactions",
                 headers={"Authorization": f"Bearer {self.token}", "Accept": "application/json"},
                 params={"query": query, "page": page},
-                timeout=self.timeout,
             )
             if r.status_code != 200:
                 raise FireflyError(f"search -> {r.status_code}: {r.text[:300]}")
@@ -113,11 +136,11 @@ class FireflyClient:
                 "category_name": category_name,
             })
         payload = {"apply_rules": False, "fire_webhooks": False, "transactions": new_txs}
-        r = requests.put(
-            f"{self.base}/api/v1/transactions/{group_id}",
+        r = self._request(
+            "PUT",
+            f"/api/v1/transactions/{group_id}",
             headers=self._h(content_type=True),
             json=payload,
-            timeout=self.timeout,
         )
         if r.status_code >= 300:
             raise FireflyError(f"PUT tx/{group_id} -> {r.status_code}: {r.text[:300]}")
@@ -206,8 +229,9 @@ class FireflyClient:
             params["start"] = start_date
         if end_date:
             params["end"] = end_date
-        r = requests.post(
-            f"{self.base}/api/v1/rule-groups/{rule_group_id}/trigger",
+        r = self._request(
+            "POST",
+            f"/api/v1/rule-groups/{rule_group_id}/trigger",
             headers=self._h(),
             params=params,
             timeout=max(self.timeout, 120),

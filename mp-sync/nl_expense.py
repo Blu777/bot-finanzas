@@ -2,17 +2,19 @@
 
 Flujo:
   texto libre -> LLM extrae {amount,desc,category,date}
-              -> buscar match en ledger CSV (monto + fecha +-1 dia)
+              -> buscar match en ledger SQLite (monto + fecha +-1 dia)
               -> si existe y tiene firefly_id: no hacer nada
               -> si existe y NO tiene firefly_id: pushear a Firefly usando
-                 la descripcion/categoria del CSV (verdad manual)
-              -> si no existe: agregar al CSV y a Firefly
+                 la descripcion/categoria del ledger (verdad manual)
+              -> si no existe: agregar al ledger y a Firefly
 """
 from __future__ import annotations
 
 import csv
 import json
 import logging
+import sqlite3
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -21,6 +23,7 @@ from google import genai
 from google.genai import types
 
 from firefly_client import FireflyClient
+from retry_utils import call_with_retries
 
 
 log = logging.getLogger(__name__)
@@ -85,15 +88,21 @@ def parse_expense(
     )
 
     client = genai.Client(api_key=gemini_api_key)
-    resp = client.models.generate_content(
-        model=model,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
-            response_mime_type="application/json",
-            response_schema=RESPONSE_SCHEMA,
-            temperature=0.0,
+    resp = call_with_retries(
+        lambda: client.models.generate_content(
+            model=model,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=SYSTEM_PROMPT,
+                response_mime_type="application/json",
+                response_schema=RESPONSE_SCHEMA,
+                temperature=0.0,
+            ),
         ),
+        attempts=3,
+        base_delay=1.0,
+        log=log,
+        label="Gemini expense parser",
     )
     data = json.loads(resp.text)
 
@@ -119,37 +128,119 @@ class LedgerRow:
     category: str = ""
     source: str = "bot"          # "manual" | "bot"
     firefly_id: str = ""
-    _row_index: int = -1         # posicion interna en el CSV (solo datos, sin header)
+    _row_index: int = -1         # id interno en SQLite
 
 
 class Ledger:
-    """CSV local como fuente de verdad manual."""
+    """SQLite local como fuente de verdad manual.
+
+    Mantiene compatibilidad con LOCAL_LEDGER_CSV: si llega /data/ledger.csv,
+    usa /data/ledger.sqlite y migra las filas del CSV legacy si existen.
+    """
 
     def __init__(self, path: str | Path):
-        self.path = Path(path)
+        requested = Path(path)
+        self.legacy_csv_path = requested if requested.suffix.lower() == ".csv" else None
+        self.path = requested.with_suffix(".sqlite") if requested.suffix.lower() == ".csv" else requested
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        if not self.path.exists():
-            with self.path.open("w", encoding="utf-8", newline="") as f:
-                csv.writer(f).writerow(LEDGER_HEADERS)
+        self._init_db()
+        self._migrate_legacy_csv()
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.path, timeout=30)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=30000")
+        return conn
+
+    @contextmanager
+    def _db(self):
+        conn = self._connect()
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
+
+    def _init_db(self) -> None:
+        with self._db() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS ledger_entries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    date TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    amount REAL NOT NULL,
+                    category TEXT NOT NULL DEFAULT '',
+                    source TEXT NOT NULL DEFAULT 'bot',
+                    firefly_id TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_ledger_amount_date
+                ON ledger_entries(amount, date)
+                """
+            )
+
+    def _migrate_legacy_csv(self) -> None:
+        if self.legacy_csv_path is None or not self.legacy_csv_path.exists():
+            return
+        with self._db() as conn:
+            count = conn.execute("SELECT COUNT(*) FROM ledger_entries").fetchone()[0]
+            if count:
+                return
+            rows = []
+            with self.legacy_csv_path.open("r", encoding="utf-8-sig", newline="") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    try:
+                        amt = float((row.get("amount") or "0").replace(",", "."))
+                    except ValueError:
+                        amt = 0.0
+                    rows.append(
+                        (
+                            (row.get("date") or "").strip(),
+                            (row.get("description") or "").strip(),
+                            amt,
+                            (row.get("category") or "").strip(),
+                            (row.get("source") or "manual").strip(),
+                            (row.get("firefly_id") or "").strip(),
+                        )
+                    )
+            if rows:
+                conn.executemany(
+                    """
+                    INSERT INTO ledger_entries
+                    (date, description, amount, category, source, firefly_id)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    rows,
+                )
+                log.info("Migradas %d filas de %s a %s", len(rows), self.legacy_csv_path, self.path)
 
     def _read_all(self) -> list[LedgerRow]:
         out: list[LedgerRow] = []
-        with self.path.open("r", encoding="utf-8-sig", newline="") as f:
-            reader = csv.DictReader(f)
-            for i, row in enumerate(reader):
-                try:
-                    amt = float((row.get("amount") or "0").replace(",", "."))
-                except ValueError:
-                    amt = 0.0
+        with self._db() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, date, description, amount, category, source, firefly_id
+                FROM ledger_entries
+                ORDER BY id
+                """
+            ).fetchall()
+            for row in rows:
                 out.append(
                     LedgerRow(
-                        date=(row.get("date") or "").strip(),
-                        description=(row.get("description") or "").strip(),
-                        amount=amt,
-                        category=(row.get("category") or "").strip(),
-                        source=(row.get("source") or "manual").strip(),
-                        firefly_id=(row.get("firefly_id") or "").strip(),
-                        _row_index=i,
+                        date=(row["date"] or "").strip(),
+                        description=(row["description"] or "").strip(),
+                        amount=float(row["amount"] or 0),
+                        category=(row["category"] or "").strip(),
+                        source=(row["source"] or "manual").strip(),
+                        firefly_id=(row["firefly_id"] or "").strip(),
+                        _row_index=int(row["id"]),
                     )
                 )
         return out
@@ -178,70 +269,63 @@ class Ledger:
         return best
 
     def append(self, row: LedgerRow) -> int:
-        existing = self._read_all()
-        new_idx = len(existing)
-        with self.path.open("a", encoding="utf-8", newline="") as f:
-            csv.writer(f).writerow(
-                [
+        with self._db() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO ledger_entries
+                (date, description, amount, category, source, firefly_id)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
                     row.date,
                     row.description,
-                    f"{row.amount:.2f}",
+                    float(row.amount),
                     row.category,
                     row.source,
                     row.firefly_id,
-                ]
+                ),
             )
-        return new_idx
+            return int(cur.lastrowid)
 
     def update_row(self, row_index: int, **fields) -> None:
-        rows = self._read_all()
-        if not (0 <= row_index < len(rows)):
-            log.warning("update_row: indice fuera de rango %s/%s", row_index, len(rows))
+        allowed = {"date", "description", "amount", "category", "source", "firefly_id"}
+        updates = {k: v for k, v in fields.items() if k in allowed}
+        if not updates:
             return
-        target = rows[row_index]
-        for k, v in fields.items():
-            if hasattr(target, k) and not k.startswith("_"):
-                setattr(target, k, v)
-        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-        with tmp.open("w", encoding="utf-8", newline="") as f:
-            w = csv.writer(f)
-            w.writerow(LEDGER_HEADERS)
-            for r in rows:
-                w.writerow(
-                    [
-                        r.date,
-                        r.description,
-                        f"{r.amount:.2f}",
-                        r.category,
-                        r.source,
-                        r.firefly_id,
-                    ]
-                )
-        tmp.replace(self.path)
+        assignments = ", ".join(f"{k} = ?" for k in updates)
+        values = list(updates.values()) + [row_index]
+        with self._db() as conn:
+            cur = conn.execute(
+                f"UPDATE ledger_entries SET {assignments} WHERE id = ?",
+                values,
+            )
+        if cur.rowcount == 0:
+            log.warning("update_row: id inexistente %s", row_index)
+            return
 
     def delete_last(self) -> LedgerRow | None:
         """Borra la ultima fila de datos y la devuelve. None si no hay datos."""
-        rows = self._read_all()
-        if not rows:
-            return None
-        removed = rows.pop()
-        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-        with tmp.open("w", encoding="utf-8", newline="") as f:
-            w = csv.writer(f)
-            w.writerow(LEDGER_HEADERS)
-            for r in rows:
-                w.writerow(
-                    [
-                        r.date,
-                        r.description,
-                        f"{r.amount:.2f}",
-                        r.category,
-                        r.source,
-                        r.firefly_id,
-                    ]
-                )
-        tmp.replace(self.path)
-        return removed
+        with self._db() as conn:
+            row = conn.execute(
+                """
+                SELECT id, date, description, amount, category, source, firefly_id
+                FROM ledger_entries
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            if row is None:
+                return None
+            conn.execute("DELETE FROM ledger_entries WHERE id = ?", (row["id"],))
+            return LedgerRow(
+                date=(row["date"] or "").strip(),
+                description=(row["description"] or "").strip(),
+                amount=float(row["amount"] or 0),
+                category=(row["category"] or "").strip(),
+                source=(row["source"] or "manual").strip(),
+                firefly_id=(row["firefly_id"] or "").strip(),
+                _row_index=int(row["id"]),
+            )
 
 
 @dataclass

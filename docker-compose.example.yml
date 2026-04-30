@@ -38,10 +38,10 @@ services:
       GEMINI_API_KEY: "REPLACE_ME_GEMINI_API_KEY"
       GEMINI_MODEL: gemini-2.5-flash
 
-      # --- Ledger CSV local (respaldo + verdad manual para gastos NL) ---
-      LOCAL_LEDGER_CSV: /data/ledger.csv
+      # --- Ledger SQLite local (respaldo + verdad manual para gastos NL) ---
+      LOCAL_LEDGER_CSV: /data/ledger.sqlite
 
     volumes:
-      # Persiste el ledger CSV fuera del contenedor.
+      # Persiste el ledger SQLite fuera del contenedor.
       # En TrueNAS Apps: montar un dataset host path aqui (ej: /mnt/tank/mp-bot-data)
       - /mnt/REPLACE_ME_POOL/mp-bot-data:/data
