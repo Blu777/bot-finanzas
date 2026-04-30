@@ -188,3 +188,28 @@ class FireflyClient:
             if r["attributes"]["title"].lower() == title.lower():
                 return r
         return None
+
+    def trigger_rule_group(
+        self,
+        rule_group_id: str | int,
+        *,
+        start_date: str | None = None,
+        end_date: str | None = None,
+    ) -> None:
+        """Aplica todas las reglas del grupo sobre transacciones existentes.
+        Equivalente a "Execute group" en la UI de Firefly."""
+        params: dict[str, str] = {}
+        if start_date:
+            params["start"] = start_date
+        if end_date:
+            params["end"] = end_date
+        r = requests.post(
+            f"{self.base}/api/v1/rule-groups/{rule_group_id}/trigger",
+            headers=self._h(),
+            params=params,
+            timeout=max(self.timeout, 120),
+        )
+        if r.status_code >= 300:
+            raise FireflyError(
+                f"trigger rule group {rule_group_id} -> {r.status_code}: {r.text[:300]}"
+            )

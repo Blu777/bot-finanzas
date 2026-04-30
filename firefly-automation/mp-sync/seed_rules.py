@@ -61,7 +61,7 @@ SEED: list[tuple[str, str]] = [
     ("disney", "Suscripciones"),
     ("hbo", "Suscripciones"),
     ("youtube premium", "Suscripciones"),
-    ("dlocal", "Suscripciones"),
+    ("Dlocal Argentina SA", "Transporte"),  # en este caso siempre es Didi (procesado via dLocal)
     # Servicios publicos
     ("edesur", "Servicios publicos"),
     ("edenor", "Servicios publicos"),

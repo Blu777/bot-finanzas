@@ -64,6 +64,7 @@ HELP = (
     "  /aprender <palabra> => <categoria> - crea regla keyword->categoria\n"
     "  /borrar_regla <id>                 - borra regla por id\n"
     "  /categorizar                       - corre Gemini sobre tx pendientes\n"
+    "  /aplicar_reglas                    - reaplica reglas a tx existentes\n"
     "\n"
     "Adjunta un CSV de Mercado Pago (Date,Description,Amount,External_ID) "
     "y lo importo a Firefly. Despues del import corro Gemini automaticamente "
@@ -272,6 +273,27 @@ async def cmd_categorizar(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await update.message.reply_text(f"```\n{ai.summary()}\n```", parse_mode="Markdown")
 
 
+async def cmd_aplicar_reglas(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _guard(update):
+        return
+    await update.message.reply_text(
+        f"Disparando grupo de reglas '{RULE_GROUP_TITLE}' sobre tx existentes..."
+    )
+    try:
+        group = await asyncio.to_thread(client.get_or_create_rule_group, RULE_GROUP_TITLE)
+        await asyncio.to_thread(client.trigger_rule_group, group["id"])
+    except FireflyError as e:
+        await update.message.reply_text(f"Error: {e}")
+        return
+    except Exception as e:
+        log.exception("trigger fallo")
+        await update.message.reply_text(f"Error inesperado: {e}")
+        return
+    await update.message.reply_text(
+        "OK. Reglas reaplicadas. Reviza /categorias y las tx en Firefly."
+    )
+
+
 async def handle_other(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _guard(update):
         return
@@ -287,6 +309,7 @@ def main() -> None:
     app.add_handler(CommandHandler("aprender", cmd_aprender))
     app.add_handler(CommandHandler("borrar_regla", cmd_borrar_regla))
     app.add_handler(CommandHandler("categorizar", cmd_categorizar))
+    app.add_handler(CommandHandler("aplicar_reglas", cmd_aplicar_reglas))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_other))
 
