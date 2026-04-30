@@ -3,6 +3,9 @@ from __future__ import annotations
 from google.genai import types
 
 
+DEFAULT_GEMINI_MODEL = "gemini-3.1-flash-lite-preview"
+
+
 def low_latency_config(
     *,
     model: str,
@@ -17,9 +20,16 @@ def low_latency_config(
         "response_schema": response_schema,
         "temperature": temperature,
     }
-    if _supports_thinking_budget(model):
+    if _supports_thinking_level(model):
+        kwargs["thinking_config"] = types.ThinkingConfig(thinking_level="minimal")
+    elif _supports_thinking_budget(model):
         kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
     return types.GenerateContentConfig(**kwargs)
+
+
+def _supports_thinking_level(model: str) -> bool:
+    normalized = model.lower()
+    return normalized.startswith("gemini-3") and "flash" in normalized
 
 
 def _supports_thinking_budget(model: str) -> bool:

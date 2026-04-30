@@ -10,7 +10,7 @@ from datetime import datetime
 from google import genai
 
 from firefly_client import FireflyClient
-from gemini_config import low_latency_config
+from gemini_config import DEFAULT_GEMINI_MODEL, low_latency_config
 from retry_utils import call_with_retries
 
 
@@ -100,7 +100,7 @@ def categorize_pending(
     gemini_api_key: str,
     *,
     tag_filter: str = "mercadopago",
-    model: str = "gemini-2.5-flash-lite",
+    model: str = DEFAULT_GEMINI_MODEL,
     rule_group_id: str | int | None = None,
 ) -> GeminiResult:
     """Busca transacciones taggeadas con `tag_filter` sin categoria y las clasifica con Gemini."""
