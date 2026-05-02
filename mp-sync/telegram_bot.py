@@ -37,7 +37,7 @@ from firefly_client import FireflyClient, FireflyError
 from firefly_import import import_csv_file
 from gemini_config import DEFAULT_GEMINI_MODEL
 from gemini_categorizer import categorize_pending
-from nl_expense import Ledger, parse_expense, record_expense
+from nl_expense import Ledger, parse_asset_account_map, parse_expense, record_expense
 
 
 logging.basicConfig(
@@ -56,10 +56,14 @@ ALLOWED_CHATS = {
 FIREFLY_URL = os.environ["FIREFLY_URL"]
 FIREFLY_TOKEN = os.environ["FIREFLY_PERSONAL_TOKEN"]
 ASSET_ID = int(os.environ["FIREFLY_ASSET_ACCOUNT_ID"])
+ASSET_ACCOUNTS = parse_asset_account_map(
+    os.environ.get("FIREFLY_ASSET_ACCOUNTS", ""),
+    default_asset_id=ASSET_ID,
+)
 CURRENCY = os.environ.get("CURRENCY", "ARS")
 RULE_GROUP_TITLE = os.environ.get("RULE_GROUP_TITLE", "mp-bot")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", DEFAULT_GEMINI_MODEL)
+GEMINI_MODEL = DEFAULT_GEMINI_MODEL
 LOCAL_LEDGER_CSV = os.environ.get("LOCAL_LEDGER_CSV", "/data/ledger.csv")
 
 
@@ -422,6 +426,7 @@ async def handle_other(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             gemini_api_key=GEMINI_API_KEY,
             model=GEMINI_MODEL,
             categories=cats,
+            account_aliases=[a for a in ASSET_ACCOUNTS if a != "default"],
         )
         if parsed.amount == 0:
             await update.message.reply_text(
@@ -587,6 +592,7 @@ async def _do_record(parsed) -> "RecordResult":
         ledger=ledger,
         firefly=client,
         asset_id=ASSET_ID,
+        asset_accounts=ASSET_ACCOUNTS,
         currency=CURRENCY,
     )
 

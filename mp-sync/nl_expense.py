@@ -1,7 +1,7 @@
 """Registro de gastos via lenguaje natural.
 
 Flujo:
-  texto libre -> LLM extrae {amount,desc,category,date}
+  texto libre -> LLM extrae {monto,descripcion,categoria,cuenta,tipo,fecha}
               -> buscar match en ledger SQLite (monto + fecha +-1 dia)
               -> si existe y tiene firefly_id: no hacer nada
               -> si existe y NO tiene firefly_id: pushear a Firefly usando
@@ -24,26 +24,35 @@ from pathlib import Path
 from google import genai
 
 from firefly_client import FireflyClient
-from gemini_config import low_latency_config
+from gemini_config import DEFAULT_GEMINI_MODEL, low_latency_config
 from retry_utils import call_with_retries
 
 
 log = logging.getLogger(__name__)
 
 
-LEDGER_HEADERS = ["date", "description", "amount", "category", "source", "firefly_id"]
+LEDGER_HEADERS = [
+    "date", "description", "amount", "category", "account", "tx_type", "source", "firefly_id",
+]
 
 
 SYSTEM_PROMPT = (
-    "Extractor de gastos/ingresos AR (es). Recibis texto informal y categorias "
-    "conocidas. Devolves JSON estricto con:\n"
-    "- amount: numero SIGNADO. Gasto=NEGATIVO, ingreso=POSITIVO. Si no aclara, "
-    "asumi gasto.\n"
+    "Extractor de movimientos financieros AR (es). Recibis texto informal, "
+    "categorias conocidas y cuentas asset conocidas. Devolves JSON estricto con "
+    "esta estructura exacta:\n"
+    '{"monto": float, "descripcion": str, "categoria": str, "cuenta": str, '
+    '"tipo": "ingreso"|"gasto", "fecha": "ISO-8601"}\n'
+    "- monto: numero positivo sin signo. El sentido del dinero va en tipo.\n"
+    "- tipo: 'gasto' si sale dinero de la cuenta asset; 'ingreso' si entra dinero "
+    "a la cuenta asset. Si no aclara, asumi gasto.\n"
+    "- cuenta: cuenta asset de origen/destino mencionada por el usuario. Usar un "
+    "alias corto de las cuentas conocidas (ej: Efectivo, Banco, MP). Si no se "
+    "menciona, dejar vacio para que el bot use la cuenta por defecto.\n"
     "- IMPORTANTE: si el usuario pone un signo explicito (- o +) antes del monto, "
-    "RESPETAR ese signo siempre. Ej: '-4000' = -4000, '+4000' = 4000.\n"
-    "- 'devolucion' / 'devolver' = dinero que SALE = NEGATIVO (es un gasto, "
-    "no un ingreso).\n"
-    "- description: descripcion LIMPIA, CAPITALIZADA y bien redactada del "
+    "RESPETAR ese signo para tipo siempre. Ej: '-4000' = gasto, '+4000' = ingreso.\n"
+    "- 'devolucion' / 'devolver' cuando el usuario devuelve dinero = gasto, "
+    "no ingreso.\n"
+    "- descripcion: descripcion LIMPIA, CAPITALIZADA y bien redactada del "
     "comercio o concepto. Primera letra de cada palabra significativa en "
     "MAYUSCULA (Title Case). Ejemplos:\n"
     "  'comida trabajo tarta de pollo' -> 'Tarta de Pollo (Almuerzo Trabajo)'\n"
@@ -54,17 +63,21 @@ SYSTEM_PROMPT = (
     "  Abreviaturas comunes se expanden: 'super'->'Supermercado', "
     "'cumple'->'Cumpleaños', 'depto'->'Departamento', 'farma'->'Farmacia'.\n"
     "  Agregar contexto entre parentesis si el usuario lo menciona.\n"
-    "- category_name: nombre EXACTO de categoria conocida que mejor encaje. "
+    "- categoria: nombre EXACTO de categoria conocida que mejor encaje. "
     "Si ninguna encaja bien, inventa un nombre nuevo corto y descriptivo "
     "(ej: 'Kiosco', 'Barberia'). Deja vacio si no hay ni idea.\n"
-    "- date: YYYY-MM-DD. Si no se menciona, usa la fecha de hoy indicada abajo.\n"
+    "- fecha: YYYY-MM-DD. Si no se menciona, usa la fecha de hoy indicada abajo.\n"
     "\n"
     "Conversiones:\n"
     "- 'lucas' o 'k' = miles (15 lucas = 15000, 3k = 3000).\n"
     "- 'palo' = millon.\n"
+    "- Frases como 'me entro', 'me entraron', 'cobre', 'recibi', 'deposito en', "
+    "'transferencia a mi cuenta' suelen ser ingresos.\n"
+    "- Frases como 'pague', 'compre', 'gaste', 'mande', 'transferi a otra persona' "
+    "suelen ser gastos.\n"
     "- 'ayer' = dia anterior a hoy, 'anteayer' = 2 dias antes.\n"
     "\n"
-    "Si no hay monto claro devolve amount=0."
+    "Si no hay monto claro devolve monto=0."
 )
 
 
@@ -75,8 +88,14 @@ RESPONSE_SCHEMA = {
         "description": {"type": "STRING"},
         "category_name": {"type": "STRING"},
         "date": {"type": "STRING"},
+        "monto": {"type": "NUMBER"},
+        "descripcion": {"type": "STRING"},
+        "categoria": {"type": "STRING"},
+        "cuenta": {"type": "STRING"},
+        "tipo": {"type": "STRING", "enum": ["ingreso", "gasto"]},
+        "fecha": {"type": "STRING"},
     },
-    "required": ["amount", "description", "category_name", "date"],
+    "required": ["monto", "descripcion", "categoria", "cuenta", "tipo", "fecha"],
 }
 
 
@@ -86,6 +105,8 @@ class ParsedExpense:
     description: str
     category: str   # "" si UNKNOWN
     date: str       # YYYY-MM-DD
+    account: str = ""  # alias de cuenta asset, ej: Efectivo, Banco, MP
+    tx_type: str = "gasto"
 
 
 _EXPLICIT_SIGN_RE = re.compile(
@@ -121,14 +142,19 @@ def parse_expense(
     gemini_api_key: str,
     model: str,
     categories: list[str],
+    account_aliases: list[str] | None = None,
     today: date | None = None,
 ) -> ParsedExpense:
     """Extrae una transaccion desde texto libre. ~300 tokens input, ~30 output."""
     today = today or date.today()
+    model = DEFAULT_GEMINI_MODEL
+    account_aliases = account_aliases or []
     prompt = (
         f"Hoy: {today.isoformat()}\n"
         "Categorias:\n"
         + "\n".join(f"{i}:{c}" for i, c in enumerate(categories))
+        + "\n\nCuentas asset conocidas:\n"
+        + "\n".join(f"- {a}" for a in account_aliases)
         + f"\n\nTexto: {text.strip()}"
     )
 
@@ -150,19 +176,32 @@ def parse_expense(
     )
     data = json.loads(resp.text)
 
-    amount = float(data.get("amount") or 0)
-    description = (data.get("description") or "").strip() or "Gasto"
-    category = (data.get("category_name") or "").strip()
+    amount = abs(float(data.get("monto", data.get("amount", 0)) or 0))
+    description = (data.get("descripcion") or data.get("description") or "").strip() or "Movimiento"
+    category = (data.get("categoria") or data.get("category_name") or "").strip()
+    account = (data.get("cuenta") or "").strip()
+    tx_type = (data.get("tipo") or "").strip().lower()
+    if tx_type not in {"ingreso", "gasto"}:
+        tx_type = "ingreso" if float(data.get("amount") or 0) > 0 else "gasto"
 
-    amount = _enforce_explicit_sign(text, amount)
+    signed_amount = amount if tx_type == "ingreso" else -amount
+    signed_amount = _enforce_explicit_sign(text, signed_amount)
+    tx_type = "ingreso" if signed_amount > 0 else "gasto"
 
-    dstr = (data.get("date") or today.isoformat()).strip()[:10]
+    dstr = (data.get("fecha") or data.get("date") or today.isoformat()).strip()[:10]
     try:
         datetime.strptime(dstr, "%Y-%m-%d")
     except ValueError:
         dstr = today.isoformat()
 
-    return ParsedExpense(amount=amount, description=description, category=category, date=dstr)
+    return ParsedExpense(
+        amount=signed_amount,
+        description=description,
+        category=category,
+        date=dstr,
+        account=account,
+        tx_type=tx_type,
+    )
 
 
 @dataclass
@@ -171,6 +210,8 @@ class LedgerRow:
     description: str
     amount: float
     category: str = ""
+    account: str = ""
+    tx_type: str = "gasto"
     source: str = "bot"          # "manual" | "bot"
     firefly_id: str = ""
     _row_index: int = -1         # id interno en SQLite
@@ -225,6 +266,54 @@ def _descriptions_compatible(a: str, b: str) -> bool:
     return True
 
 
+def parse_asset_account_map(raw: str, *, default_asset_id: int) -> dict[str, int]:
+    """Parsea 'Efectivo:1,Banco:2,MP:3' para resolver cuentas asset."""
+    accounts: dict[str, int] = {"default": int(default_asset_id)}
+    for item in (raw or "").split(","):
+        if ":" not in item:
+            continue
+        name, value = item.split(":", 1)
+        name = name.strip()
+        try:
+            account_id = int(value.strip())
+        except ValueError:
+            continue
+        if name:
+            accounts[name] = account_id
+    return accounts
+
+
+def _normalize_account_key(value: str) -> str:
+    return re.sub(r"\s+", " ", _strip_accents(value).lower()).strip()
+
+
+def resolve_asset_account_id(
+    account_name: str,
+    account_map: dict[str, int] | None,
+    *,
+    default_asset_id: int,
+) -> int:
+    """Mapea alias de cuenta a account_id de Firefly III con fallback seguro."""
+    if not account_map:
+        return int(default_asset_id)
+    default_id = int(account_map.get("default", default_asset_id))
+    needle = _normalize_account_key(account_name)
+    if not needle:
+        return default_id
+
+    normalized = {
+        _normalize_account_key(alias): int(account_id)
+        for alias, account_id in account_map.items()
+        if alias != "default"
+    }
+    if needle in normalized:
+        return normalized[needle]
+    for alias, account_id in normalized.items():
+        if alias and (alias in needle or needle in alias):
+            return account_id
+    return default_id
+
+
 class Ledger:
     """SQLite local como fuente de verdad manual.
 
@@ -266,12 +355,16 @@ class Ledger:
                     description TEXT NOT NULL,
                     amount REAL NOT NULL,
                     category TEXT NOT NULL DEFAULT '',
+                    account TEXT NOT NULL DEFAULT '',
+                    tx_type TEXT NOT NULL DEFAULT 'gasto',
                     source TEXT NOT NULL DEFAULT 'bot',
                     firefly_id TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 )
                 """
             )
+            self._ensure_column(conn, "ledger_entries", "account", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "ledger_entries", "tx_type", "TEXT NOT NULL DEFAULT 'gasto'")
             conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_ledger_amount_date
@@ -349,6 +442,20 @@ class Ledger:
                 """
             )
 
+    @staticmethod
+    def _ensure_column(
+        conn: sqlite3.Connection,
+        table: str,
+        column: str,
+        definition: str,
+    ) -> None:
+        existing = {
+            str(row["name"])
+            for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        if column not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
     def _migrate_legacy_csv(self) -> None:
         if self.legacy_csv_path is None or not self.legacy_csv_path.exists():
             return
@@ -370,6 +477,8 @@ class Ledger:
                             (row.get("description") or "").strip(),
                             amt,
                             (row.get("category") or "").strip(),
+                            (row.get("account") or row.get("cuenta") or "").strip(),
+                            (row.get("tx_type") or row.get("tipo") or ("ingreso" if amt > 0 else "gasto")).strip(),
                             (row.get("source") or "manual").strip(),
                             (row.get("firefly_id") or "").strip(),
                         )
@@ -378,8 +487,8 @@ class Ledger:
                 conn.executemany(
                     """
                     INSERT INTO ledger_entries
-                    (date, description, amount, category, source, firefly_id)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    (date, description, amount, category, account, tx_type, source, firefly_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     rows,
                 )
@@ -406,7 +515,7 @@ class Ledger:
         with self._db() as conn:
             rows = conn.execute(
                 """
-                SELECT id, date, description, amount, category, source, firefly_id
+                SELECT id, date, description, amount, category, account, tx_type, source, firefly_id
                 FROM ledger_entries
                 ORDER BY id DESC
                 LIMIT ?
@@ -419,6 +528,8 @@ class Ledger:
                 description=(row["description"] or "").strip(),
                 amount=float(row["amount"] or 0),
                 category=(row["category"] or "").strip(),
+                account=(row["account"] or "").strip(),
+                tx_type=(row["tx_type"] or ("ingreso" if float(row["amount"] or 0) > 0 else "gasto")).strip(),
                 source=(row["source"] or "manual").strip(),
                 firefly_id=(row["firefly_id"] or "").strip(),
                 _row_index=int(row["id"]),
@@ -431,7 +542,7 @@ class Ledger:
         with self._db() as conn:
             rows = conn.execute(
                 """
-                SELECT id, date, description, amount, category, source, firefly_id
+                SELECT id, date, description, amount, category, account, tx_type, source, firefly_id
                 FROM ledger_entries
                 WHERE description LIKE ? OR category LIKE ? OR firefly_id LIKE ?
                 ORDER BY id DESC
@@ -445,6 +556,8 @@ class Ledger:
                 description=(row["description"] or "").strip(),
                 amount=float(row["amount"] or 0),
                 category=(row["category"] or "").strip(),
+                account=(row["account"] or "").strip(),
+                tx_type=(row["tx_type"] or ("ingreso" if float(row["amount"] or 0) > 0 else "gasto")).strip(),
                 source=(row["source"] or "manual").strip(),
                 firefly_id=(row["firefly_id"] or "").strip(),
                 _row_index=int(row["id"]),
@@ -567,7 +680,7 @@ class Ledger:
         with self._db() as conn:
             rows = conn.execute(
                 """
-                SELECT id, date, description, amount, category, source, firefly_id
+                SELECT id, date, description, amount, category, account, tx_type, source, firefly_id
                 FROM ledger_entries
                 ORDER BY id
                 """
@@ -579,6 +692,8 @@ class Ledger:
                         description=(row["description"] or "").strip(),
                         amount=float(row["amount"] or 0),
                         category=(row["category"] or "").strip(),
+                        account=(row["account"] or "").strip(),
+                        tx_type=(row["tx_type"] or ("ingreso" if float(row["amount"] or 0) > 0 else "gasto")).strip(),
                         source=(row["source"] or "manual").strip(),
                         firefly_id=(row["firefly_id"] or "").strip(),
                         _row_index=int(row["id"]),
@@ -632,14 +747,16 @@ class Ledger:
             cur = conn.execute(
                 """
                 INSERT INTO ledger_entries
-                (date, description, amount, category, source, firefly_id)
-                VALUES (?, ?, ?, ?, ?, ?)
+                (date, description, amount, category, account, tx_type, source, firefly_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     row.date,
                     row.description,
                     float(row.amount),
                     row.category,
+                    row.account,
+                    row.tx_type,
                     row.source,
                     row.firefly_id,
                 ),
@@ -647,7 +764,7 @@ class Ledger:
             return int(cur.lastrowid)
 
     def update_row(self, row_index: int, **fields) -> None:
-        allowed = {"date", "description", "amount", "category", "source", "firefly_id"}
+        allowed = {"date", "description", "amount", "category", "account", "tx_type", "source", "firefly_id"}
         updates = {k: v for k, v in fields.items() if k in allowed}
         if not updates:
             return
@@ -667,7 +784,7 @@ class Ledger:
         with self._db() as conn:
             row = conn.execute(
                 """
-                SELECT id, date, description, amount, category, source, firefly_id
+                SELECT id, date, description, amount, category, account, tx_type, source, firefly_id
                 FROM ledger_entries
                 ORDER BY id DESC
                 LIMIT 1
@@ -681,6 +798,8 @@ class Ledger:
                 description=(row["description"] or "").strip(),
                 amount=float(row["amount"] or 0),
                 category=(row["category"] or "").strip(),
+                account=(row["account"] or "").strip(),
+                tx_type=(row["tx_type"] or ("ingreso" if float(row["amount"] or 0) > 0 else "gasto")).strip(),
                 source=(row["source"] or "manual").strip(),
                 firefly_id=(row["firefly_id"] or "").strip(),
                 _row_index=int(row["id"]),
@@ -697,9 +816,11 @@ class RecordResult:
         r = self.row
         sign = "-" if r.amount < 0 else "+"
         cat = r.category or "(sin categoria)"
+        account = f"  cuenta={r.account}" if r.account else ""
         return (
             f"[{self.action}] {r.date}  {sign}${abs(r.amount):,.2f}  "
             f"{r.description}  [{cat}]"
+            + account
             + (f"  firefly#{r.firefly_id}" if r.firefly_id else "")
             + (f"\n{self.message}" if self.message else "")
         )
@@ -711,6 +832,7 @@ def record_expense(
     ledger: Ledger,
     firefly: FireflyClient,
     asset_id: int,
+    asset_accounts: dict[str, int] | None = None,
     currency: str = "ARS",
 ) -> RecordResult:
     if parsed.amount == 0:
@@ -721,20 +843,17 @@ def record_expense(
                 description=parsed.description,
                 amount=0,
                 category=parsed.category,
+                account=parsed.account,
+                tx_type=parsed.tx_type,
             ),
             message="No se reconocio un monto.",
         )
 
     match = ledger.find_match(
-        parsed.amount, parsed.date, tolerance_days=1, description=parsed.description
+        parsed.amount, parsed.date, tolerance_days=0
     )
 
     if match is not None:
-        # Fecha: corregir si difiere (metadato tecnico), contenido intacto.
-        if match.date != parsed.date:
-            ledger.update_row(match._row_index, date=parsed.date)
-            match.date = parsed.date
-
         if match.firefly_id:
             return RecordResult(
                 action="already_synced",
@@ -742,8 +861,29 @@ def record_expense(
                 message="Ya existia en CSV y en Firefly.",
             )
 
+        # Fecha/cuenta/tipo son metadata tecnica de sincronizacion; la
+        # descripcion/categoria manual del ledger siguen siendo la verdad.
+        updates: dict[str, str] = {}
+        if match.date != parsed.date:
+            updates["date"] = parsed.date
+            match.date = parsed.date
+        if parsed.account and match.account != parsed.account:
+            updates["account"] = parsed.account
+            match.account = parsed.account
+        if parsed.tx_type and match.tx_type != parsed.tx_type:
+            updates["tx_type"] = parsed.tx_type
+            match.tx_type = parsed.tx_type
+        if updates:
+            ledger.update_row(match._row_index, **updates)
+
         # Existe en CSV pero no en Firefly. La descripcion/categoria del CSV ganan.
-        fid = _push_firefly(match, firefly=firefly, asset_id=asset_id, currency=currency)
+        fid = _push_firefly(
+            match,
+            firefly=firefly,
+            asset_id=asset_id,
+            asset_accounts=asset_accounts,
+            currency=currency,
+        )
         ledger.update_row(match._row_index, firefly_id=fid)
         match.firefly_id = fid
         return RecordResult(
@@ -758,9 +898,17 @@ def record_expense(
         description=parsed.description,
         amount=parsed.amount,
         category=parsed.category,
+        account=parsed.account,
+        tx_type=parsed.tx_type,
         source="bot",
     )
-    fid = _push_firefly(new_row, firefly=firefly, asset_id=asset_id, currency=currency)
+    fid = _push_firefly(
+        new_row,
+        firefly=firefly,
+        asset_id=asset_id,
+        asset_accounts=asset_accounts,
+        currency=currency,
+    )
     new_row.firefly_id = fid
     idx = ledger.append(new_row)
     new_row._row_index = idx
@@ -777,8 +925,14 @@ def _push_firefly(
     firefly: FireflyClient,
     asset_id: int,
     currency: str,
+    asset_accounts: dict[str, int] | None = None,
 ) -> str:
     is_withdrawal = row.amount < 0
+    account_id = resolve_asset_account_id(
+        row.account,
+        asset_accounts,
+        default_asset_id=asset_id,
+    )
     amount_abs = f"{abs(row.amount):.2f}"
     desc = row.description or ("Gasto" if is_withdrawal else "Ingreso")
 
@@ -794,11 +948,11 @@ def _push_firefly(
     if row.category:
         tx["category_name"] = row.category
     if is_withdrawal:
-        tx["source_id"] = asset_id
+        tx["source_id"] = account_id
         tx["destination_name"] = desc
     else:
         tx["source_name"] = desc
-        tx["destination_id"] = asset_id
+        tx["destination_id"] = account_id
 
     payload = {
         "error_if_duplicate_hash": False,
