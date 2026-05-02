@@ -147,7 +147,6 @@ def parse_expense(
 ) -> ParsedExpense:
     """Extrae una transaccion desde texto libre. ~300 tokens input, ~30 output."""
     today = today or date.today()
-    model = DEFAULT_GEMINI_MODEL
     account_aliases = account_aliases or []
     prompt = (
         f"Hoy: {today.isoformat()}\n"
@@ -456,6 +455,21 @@ class Ledger:
         if column not in existing:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
+    @staticmethod
+    def _row_to_ledger_row(row: sqlite3.Row) -> LedgerRow:
+        amount = float(row["amount"] or 0)
+        return LedgerRow(
+            date=(row["date"] or "").strip(),
+            description=(row["description"] or "").strip(),
+            amount=amount,
+            category=(row["category"] or "").strip(),
+            account=(row["account"] or "").strip(),
+            tx_type=(row["tx_type"] or ("ingreso" if amount > 0 else "gasto")).strip(),
+            source=(row["source"] or "manual").strip(),
+            firefly_id=(row["firefly_id"] or "").strip(),
+            _row_index=int(row["id"]),
+        )
+
     def _migrate_legacy_csv(self) -> None:
         if self.legacy_csv_path is None or not self.legacy_csv_path.exists():
             return
@@ -522,20 +536,7 @@ class Ledger:
                 """,
                 (max(1, min(limit, 20)),),
             ).fetchall()
-        return [
-            LedgerRow(
-                date=(row["date"] or "").strip(),
-                description=(row["description"] or "").strip(),
-                amount=float(row["amount"] or 0),
-                category=(row["category"] or "").strip(),
-                account=(row["account"] or "").strip(),
-                tx_type=(row["tx_type"] or ("ingreso" if float(row["amount"] or 0) > 0 else "gasto")).strip(),
-                source=(row["source"] or "manual").strip(),
-                firefly_id=(row["firefly_id"] or "").strip(),
-                _row_index=int(row["id"]),
-            )
-            for row in rows
-        ]
+        return [self._row_to_ledger_row(row) for row in rows]
 
     def search_entries(self, term: str, limit: int = 10) -> list[LedgerRow]:
         needle = f"%{term.strip()}%"
@@ -550,20 +551,7 @@ class Ledger:
                 """,
                 (needle, needle, needle, max(1, min(limit, 30))),
             ).fetchall()
-        return [
-            LedgerRow(
-                date=(row["date"] or "").strip(),
-                description=(row["description"] or "").strip(),
-                amount=float(row["amount"] or 0),
-                category=(row["category"] or "").strip(),
-                account=(row["account"] or "").strip(),
-                tx_type=(row["tx_type"] or ("ingreso" if float(row["amount"] or 0) > 0 else "gasto")).strip(),
-                source=(row["source"] or "manual").strip(),
-                firefly_id=(row["firefly_id"] or "").strip(),
-                _row_index=int(row["id"]),
-            )
-            for row in rows
-        ]
+        return [self._row_to_ledger_row(row) for row in rows]
 
     def search_import_rows(self, term: str, limit: int = 10) -> list[LedgerRow]:
         needle = f"%{term.strip()}%"
@@ -686,19 +674,7 @@ class Ledger:
                 """
             ).fetchall()
             for row in rows:
-                out.append(
-                    LedgerRow(
-                        date=(row["date"] or "").strip(),
-                        description=(row["description"] or "").strip(),
-                        amount=float(row["amount"] or 0),
-                        category=(row["category"] or "").strip(),
-                        account=(row["account"] or "").strip(),
-                        tx_type=(row["tx_type"] or ("ingreso" if float(row["amount"] or 0) > 0 else "gasto")).strip(),
-                        source=(row["source"] or "manual").strip(),
-                        firefly_id=(row["firefly_id"] or "").strip(),
-                        _row_index=int(row["id"]),
-                    )
-                )
+                out.append(self._row_to_ledger_row(row))
         return out
 
     def find_match(
@@ -793,17 +769,7 @@ class Ledger:
             if row is None:
                 return None
             conn.execute("DELETE FROM ledger_entries WHERE id = ?", (row["id"],))
-            return LedgerRow(
-                date=(row["date"] or "").strip(),
-                description=(row["description"] or "").strip(),
-                amount=float(row["amount"] or 0),
-                category=(row["category"] or "").strip(),
-                account=(row["account"] or "").strip(),
-                tx_type=(row["tx_type"] or ("ingreso" if float(row["amount"] or 0) > 0 else "gasto")).strip(),
-                source=(row["source"] or "manual").strip(),
-                firefly_id=(row["firefly_id"] or "").strip(),
-                _row_index=int(row["id"]),
-            )
+            return self._row_to_ledger_row(row)
 
 
 @dataclass
@@ -850,7 +816,10 @@ def record_expense(
         )
 
     match = ledger.find_match(
-        parsed.amount, parsed.date, tolerance_days=0
+        parsed.amount,
+        parsed.date,
+        tolerance_days=0,
+        description=parsed.description,
     )
 
     if match is not None:

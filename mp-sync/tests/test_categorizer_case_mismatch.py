@@ -218,6 +218,23 @@ class TestCategorizerCaseMismatch:
         assert result.unknown == 1
         assert result.classified == 0
 
+    def test_uses_requested_model(self):
+        firefly = _fake_firefly(categories=["Supermercado"])
+        gemini_response = _fake_gemini_response(["Supermercado"])
+
+        with patch("gemini_categorizer.genai") as mock_genai:
+            mock_client = mock_genai.Client.return_value
+            mock_client.models.generate_content.return_value = gemini_response
+
+            categorize_pending(
+                firefly,
+                gemini_api_key="fake-key",
+                model="gemini-custom-test",
+            )
+
+        mock_client.models.generate_content.assert_called_once()
+        assert mock_client.models.generate_content.call_args.kwargs["model"] == "gemini-custom-test"
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

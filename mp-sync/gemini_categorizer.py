@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -104,7 +103,6 @@ def categorize_pending(
     rule_group_id: str | int | None = None,
 ) -> GeminiResult:
     """Busca transacciones taggeadas con `tag_filter` sin categoria y las clasifica con Gemini."""
-    model = DEFAULT_GEMINI_MODEL
     res = GeminiResult()
 
     # 1. listar candidatos: tag mercadopago + sin categoria + sin tag de IA-miss

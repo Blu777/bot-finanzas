@@ -13,7 +13,13 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from nl_expense import Ledger, LedgerRow, _descriptions_compatible
+from nl_expense import (
+    Ledger,
+    LedgerRow,
+    ParsedExpense,
+    _descriptions_compatible,
+    record_expense,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -175,3 +181,30 @@ class TestFindMatchDescription:
         match = self.ledger.find_match(30000, "2026-03-21", description="Transferencia Felipe")
         assert match is not None
         assert "Felipe" in match.description
+
+    def test_record_expense_uses_description_to_avoid_wrong_synced_match(self):
+        self._add("Transferencia Ivi", 4000, "2026-04-30", firefly_id="93")
+        joaco_id = self._add("Transferencia Joaco", 4000, "2026-04-30")
+        parsed = ParsedExpense(
+            amount=4000,
+            description="Transferencia Joaco",
+            category="Transferencias",
+            date="2026-04-30",
+            tx_type="ingreso",
+        )
+
+        class FakeFirefly:
+            def create_transaction(self, payload):
+                return {"data": {"id": "94"}}
+
+        result = record_expense(
+            parsed,
+            ledger=self.ledger,
+            firefly=FakeFirefly(),
+            asset_id=1,
+        )
+
+        assert result.action == "synced_from_csv"
+        assert result.row._row_index == joaco_id
+        assert result.row.description == "Transferencia Joaco"
+        assert result.row.firefly_id == "94"

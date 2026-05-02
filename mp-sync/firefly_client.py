@@ -95,7 +95,9 @@ class FireflyClient:
             params={"query": f"external_id:{external_id}"},
         )
         if r.status_code != 200:
-            return False
+            raise FireflyError(
+                f"search external_id:{external_id} -> {r.status_code}: {r.text[:300]}"
+            )
         return len(r.json().get("data", [])) > 0
 
     def create_transaction(self, payload: dict) -> dict:
