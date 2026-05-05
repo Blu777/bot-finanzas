@@ -41,17 +41,22 @@ SYSTEM_PROMPT = (
     "categorias conocidas y cuentas asset conocidas. Devolves JSON estricto con "
     "esta estructura exacta:\n"
     '{"monto": float, "descripcion": str, "categoria": str, "cuenta": str, '
-    '"tipo": "ingreso"|"gasto", "fecha": "ISO-8601"}\n'
+    '"tipo": "ingreso"|"gasto"|"transferencia", "cuenta_destino": str, "fecha": "ISO-8601"}\n'
     "- monto: numero positivo sin signo. El sentido del dinero va en tipo.\n"
     "- tipo: 'gasto' si sale dinero de la cuenta asset; 'ingreso' si entra dinero "
-    "a la cuenta asset. Si no aclara, asumi gasto.\n"
-    "- cuenta: cuenta asset de origen/destino mencionada por el usuario. Usar un "
-    "alias corto de las cuentas conocidas (ej: Efectivo, Banco, MP). Si no se "
-    "menciona, dejar vacio para que el bot use la cuenta por defecto.\n"
+    "a la cuenta asset; 'transferencia' si mueve dinero entre cuentas asset. "
+    "Si no aclara, asumi gasto.\n"
+    "- cuenta: cuenta asset de ORIGEN (de donde sale el dinero). Usar alias corto "
+    "de las cuentas conocidas (ej: Efectivo, Banco, MP). Si no se menciona, dejar "
+    "vacio para que el bot use la cuenta por defecto.\n"
+    "- cuenta_destino: cuenta asset de DESTINO (a donde llega el dinero). Solo "
+    "para tipo=transferencia. Si no se menciona, dejar vacio.\n"
     "- IMPORTANTE: si el usuario pone un signo explicito (- o +) antes del monto, "
-    "RESPETAR ese signo para tipo siempre. Ej: '-4000' = gasto, '+4000' = ingreso.\n"
+    "RESPETAR ese signo para tipo siempre (excepto transferencia). Ej: '-4000' = gasto, '+4000' = ingreso.\n"
     "- 'devolucion' / 'devolver' cuando el usuario devuelve dinero = gasto, "
     "no ingreso.\n"
+    "- 'retiro' / 'extraccion' de una cuenta = transferencia hacia Efectivo.\n"
+    "- 'deposito' en una cuenta = transferencia desde Efectivo (u origen default).\n"
     "- descripcion: descripcion LIMPIA, CAPITALIZADA y bien redactada del "
     "comercio o concepto. Primera letra de cada palabra significativa en "
     "MAYUSCULA (Title Case). Ejemplos:\n"
@@ -92,7 +97,8 @@ RESPONSE_SCHEMA = {
         "descripcion": {"type": "STRING"},
         "categoria": {"type": "STRING"},
         "cuenta": {"type": "STRING"},
-        "tipo": {"type": "STRING", "enum": ["ingreso", "gasto"]},
+        "tipo": {"type": "STRING", "enum": ["ingreso", "gasto", "transferencia"]},
+        "cuenta_destino": {"type": "STRING"},
         "fecha": {"type": "STRING"},
     },
     "required": ["monto", "descripcion", "categoria", "cuenta", "tipo", "fecha"],
@@ -101,11 +107,12 @@ RESPONSE_SCHEMA = {
 
 @dataclass
 class ParsedExpense:
-    amount: float   # signed: negativo = gasto
+    amount: float   # signed: negativo = gasto; transferencia = positivo
     description: str
     category: str   # "" si UNKNOWN
     date: str       # YYYY-MM-DD
-    account: str = ""  # alias de cuenta asset, ej: Efectivo, Banco, MP
+    account: str = ""  # alias de cuenta asset origen, ej: Efectivo, Banco, MP
+    account_dest: str = ""  # alias cuenta destino (solo transferencia)
     tx_type: str = "gasto"
 
 
@@ -180,12 +187,17 @@ def parse_expense(
     category = (data.get("categoria") or data.get("category_name") or "").strip()
     account = (data.get("cuenta") or "").strip()
     tx_type = (data.get("tipo") or "").strip().lower()
-    if tx_type not in {"ingreso", "gasto"}:
+    if tx_type not in {"ingreso", "gasto", "transferencia"}:
         tx_type = "ingreso" if float(data.get("amount") or 0) > 0 else "gasto"
 
-    signed_amount = amount if tx_type == "ingreso" else -amount
-    signed_amount = _enforce_explicit_sign(text, signed_amount)
-    tx_type = "ingreso" if signed_amount > 0 else "gasto"
+    account_dest = (data.get("cuenta_destino") or "").strip()
+
+    if tx_type == "transferencia":
+        signed_amount = amount  # transferencias son positivas
+    else:
+        signed_amount = amount if tx_type == "ingreso" else -amount
+        signed_amount = _enforce_explicit_sign(text, signed_amount)
+        tx_type = "ingreso" if signed_amount > 0 else "gasto"
 
     dstr = (data.get("fecha") or data.get("date") or today.isoformat()).strip()[:10]
     try:
@@ -199,6 +211,7 @@ def parse_expense(
         category=category,
         date=dstr,
         account=account,
+        account_dest=account_dest,
         tx_type=tx_type,
     )
 
@@ -210,6 +223,7 @@ class LedgerRow:
     amount: float
     category: str = ""
     account: str = ""
+    account_dest: str = ""
     tx_type: str = "gasto"
     source: str = "bot"          # "manual" | "bot"
     firefly_id: str = ""
@@ -363,6 +377,7 @@ class Ledger:
                 """
             )
             self._ensure_column(conn, "ledger_entries", "account", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "ledger_entries", "account_dest", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "ledger_entries", "tx_type", "TEXT NOT NULL DEFAULT 'gasto'")
             conn.execute(
                 """
@@ -464,6 +479,7 @@ class Ledger:
             amount=amount,
             category=(row["category"] or "").strip(),
             account=(row["account"] or "").strip(),
+            account_dest=(row["account_dest"] or "").strip(),
             tx_type=(row["tx_type"] or ("ingreso" if amount > 0 else "gasto")).strip(),
             source=(row["source"] or "manual").strip(),
             firefly_id=(row["firefly_id"] or "").strip(),
@@ -529,7 +545,7 @@ class Ledger:
         with self._db() as conn:
             rows = conn.execute(
                 """
-                SELECT id, date, description, amount, category, account, tx_type, source, firefly_id
+                SELECT id, date, description, amount, category, account, account_dest, tx_type, source, firefly_id
                 FROM ledger_entries
                 ORDER BY id DESC
                 LIMIT ?
@@ -543,7 +559,7 @@ class Ledger:
         with self._db() as conn:
             rows = conn.execute(
                 """
-                SELECT id, date, description, amount, category, account, tx_type, source, firefly_id
+                SELECT id, date, description, amount, category, account, account_dest, tx_type, source, firefly_id
                 FROM ledger_entries
                 WHERE description LIKE ? OR category LIKE ? OR firefly_id LIKE ?
                 ORDER BY id DESC
@@ -668,7 +684,7 @@ class Ledger:
         with self._db() as conn:
             rows = conn.execute(
                 """
-                SELECT id, date, description, amount, category, account, tx_type, source, firefly_id
+                SELECT id, date, description, amount, category, account, account_dest, tx_type, source, firefly_id
                 FROM ledger_entries
                 ORDER BY id
                 """
@@ -723,8 +739,8 @@ class Ledger:
             cur = conn.execute(
                 """
                 INSERT INTO ledger_entries
-                (date, description, amount, category, account, tx_type, source, firefly_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (date, description, amount, category, account, account_dest, tx_type, source, firefly_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     row.date,
@@ -732,6 +748,7 @@ class Ledger:
                     float(row.amount),
                     row.category,
                     row.account,
+                    row.account_dest,
                     row.tx_type,
                     row.source,
                     row.firefly_id,
@@ -740,7 +757,7 @@ class Ledger:
             return int(cur.lastrowid)
 
     def update_row(self, row_index: int, **fields) -> None:
-        allowed = {"date", "description", "amount", "category", "account", "tx_type", "source", "firefly_id"}
+        allowed = {"date", "description", "amount", "category", "account", "account_dest", "tx_type", "source", "firefly_id"}
         updates = {k: v for k, v in fields.items() if k in allowed}
         if not updates:
             return
@@ -760,7 +777,7 @@ class Ledger:
         with self._db() as conn:
             row = conn.execute(
                 """
-                SELECT id, date, description, amount, category, account, tx_type, source, firefly_id
+                SELECT id, date, description, amount, category, account, account_dest, tx_type, source, firefly_id
                 FROM ledger_entries
                 ORDER BY id DESC
                 LIMIT 1
@@ -780,9 +797,14 @@ class RecordResult:
 
     def summary(self) -> str:
         r = self.row
-        sign = "-" if r.amount < 0 else "+"
+        if r.tx_type == "transferencia":
+            sign = "=>"
+        else:
+            sign = "-" if r.amount < 0 else "+"
         cat = r.category or "(sin categoria)"
         account = f"  cuenta={r.account}" if r.account else ""
+        if r.account_dest:
+            account += f" => {r.account_dest}"
         return (
             f"[{self.action}] {r.date}  {sign}${abs(r.amount):,.2f}  "
             f"{r.description}  [{cat}]"
@@ -839,6 +861,9 @@ def record_expense(
         if parsed.account and match.account != parsed.account:
             updates["account"] = parsed.account
             match.account = parsed.account
+        if parsed.account_dest and match.account_dest != parsed.account_dest:
+            updates["account_dest"] = parsed.account_dest
+            match.account_dest = parsed.account_dest
         if parsed.tx_type and match.tx_type != parsed.tx_type:
             updates["tx_type"] = parsed.tx_type
             match.tx_type = parsed.tx_type
@@ -868,6 +893,7 @@ def record_expense(
         amount=parsed.amount,
         category=parsed.category,
         account=parsed.account,
+        account_dest=parsed.account_dest,
         tx_type=parsed.tx_type,
         source="bot",
     )
@@ -905,23 +931,42 @@ def _push_firefly(
     amount_abs = f"{abs(row.amount):.2f}"
     desc = row.description or ("Gasto" if is_withdrawal else "Ingreso")
 
-    tx: dict = {
-        "type": "withdrawal" if is_withdrawal else "deposit",
-        "date": row.date,
-        "amount": amount_abs,
-        "currency_code": currency,
-        "description": desc,
-        "tags": ["telegram-bot", "nl"],
-        "notes": "Registrado via Telegram bot (lenguaje natural).",
-    }
+    if row.tx_type == "transferencia":
+        dest_id = resolve_asset_account_id(
+            row.account_dest,
+            asset_accounts,
+            default_asset_id=asset_id,
+        )
+        tx: dict = {
+            "type": "transfer",
+            "date": row.date,
+            "amount": amount_abs,
+            "currency_code": currency,
+            "description": desc,
+            "source_id": account_id,
+            "destination_id": dest_id,
+            "tags": ["telegram-bot", "nl"],
+            "notes": "Registrado via Telegram bot (lenguaje natural).",
+        }
+    else:
+        tx: dict = {
+            "type": "withdrawal" if is_withdrawal else "deposit",
+            "date": row.date,
+            "amount": amount_abs,
+            "currency_code": currency,
+            "description": desc,
+            "tags": ["telegram-bot", "nl"],
+            "notes": "Registrado via Telegram bot (lenguaje natural).",
+        }
+        if is_withdrawal:
+            tx["source_id"] = account_id
+            tx["destination_name"] = desc
+        else:
+            tx["source_name"] = desc
+            tx["destination_id"] = account_id
+
     if row.category:
         tx["category_name"] = row.category
-    if is_withdrawal:
-        tx["source_id"] = account_id
-        tx["destination_name"] = desc
-    else:
-        tx["source_name"] = desc
-        tx["destination_id"] = account_id
 
     payload = {
         "error_if_duplicate_hash": False,
