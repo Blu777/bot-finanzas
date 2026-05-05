@@ -71,6 +71,26 @@ client = FireflyClient(FIREFLY_URL, FIREFLY_TOKEN)
 ledger = Ledger(LOCAL_LEDGER_CSV)
 
 
+def _validate_asset_accounts():
+    ids = {ASSET_ID}
+    ids.update(ASSET_ACCOUNTS.values())
+    for aid in ids:
+        acc = client.get_account(aid)
+        if not acc:
+            raise RuntimeError(
+                f"Cuenta asset ID {aid} no existe en Firefly. "
+                "Revisa FIREFLY_ASSET_ACCOUNT_ID y FIREFLY_ASSET_ACCOUNTS."
+            )
+        if acc["attributes"]["type"] != "asset":
+            raise RuntimeError(
+                f"Cuenta ID {aid} en Firefly es tipo '{acc['attributes']['type']}', "
+                f"no 'asset'. Revisa FIREFLY_ASSET_ACCOUNT_ID."
+            )
+
+
+_validate_asset_accounts()
+
+
 HELP = (
     "Comandos:\n"
     "  /start /help                       - este mensaje\n"

@@ -85,6 +85,15 @@ class FireflyClient:
                 return
             page += 1
 
+    # ---------- accounts ----------
+    def get_account(self, account_id: str | int) -> dict | None:
+        r = self._request("GET", f"/api/v1/accounts/{account_id}", headers=self._h())
+        if r.status_code == 404:
+            return None
+        if r.status_code >= 300:
+            raise FireflyError(f"GET /api/v1/accounts/{account_id} -> {r.status_code}: {r.text[:300]}")
+        return r.json().get("data")
+
     # ---------- transactions ----------
     def transaction_exists(self, external_id: str) -> bool:
         # /api/v1/search/transactions usa accept: application/json (no api+json)
