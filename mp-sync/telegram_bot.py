@@ -18,6 +18,7 @@ import asyncio
 import logging
 import os
 import tempfile
+import time
 from pathlib import Path
 
 import dataclasses
@@ -33,11 +34,12 @@ from telegram.ext import (
     filters,
 )
 
+from config import Settings
 from firefly_client import FireflyClient, FireflyError
 from firefly_import import import_csv_file
 from gemini_config import DEFAULT_GEMINI_MODEL
 from gemini_categorizer import categorize_pending
-from nl_expense import Ledger, parse_asset_account_map, parse_expense, record_expense
+from nl_expense import Ledger, parse_asset_account_map, parse_expenses, record_expense
 
 
 logging.basicConfig(
@@ -47,24 +49,20 @@ logging.basicConfig(
 log = logging.getLogger("mp-bot")
 
 
-BOT_VERSION = "1.3"
+BOT_VERSION = "1.4"
 
-BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-ALLOWED_CHATS = {
-    int(x.strip()) for x in os.environ.get("TELEGRAM_ALLOWED_CHATS", "").split(",") if x.strip()
-}
-FIREFLY_URL = os.environ["FIREFLY_URL"]
-FIREFLY_TOKEN = os.environ["FIREFLY_PERSONAL_TOKEN"]
-ASSET_ID = int(os.environ["FIREFLY_ASSET_ACCOUNT_ID"])
-ASSET_ACCOUNTS = parse_asset_account_map(
-    os.environ.get("FIREFLY_ASSET_ACCOUNTS", ""),
-    default_asset_id=ASSET_ID,
-)
-CURRENCY = os.environ.get("CURRENCY", "ARS")
-RULE_GROUP_TITLE = os.environ.get("RULE_GROUP_TITLE", "mp-bot")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = DEFAULT_GEMINI_MODEL
-LOCAL_LEDGER_CSV = os.environ.get("LOCAL_LEDGER_CSV", "/data/ledger.csv")
+_cfg = Settings.from_env()
+BOT_TOKEN = _cfg.bot_token
+ALLOWED_CHATS = _cfg.allowed_chats
+FIREFLY_URL = _cfg.firefly_url
+FIREFLY_TOKEN = _cfg.firefly_token
+ASSET_ID = _cfg.asset_id
+ASSET_ACCOUNTS = _cfg.asset_accounts
+CURRENCY = _cfg.currency
+RULE_GROUP_TITLE = _cfg.rule_group_title
+GEMINI_API_KEY = _cfg.gemini_api_key
+GEMINI_MODEL = _cfg.gemini_model or DEFAULT_GEMINI_MODEL
+LOCAL_LEDGER_CSV = _cfg.local_ledger_csv
 
 
 client = FireflyClient(FIREFLY_URL, FIREFLY_TOKEN)
@@ -106,6 +104,7 @@ HELP = (
     "  /estado                           - salud basica del bot\n"
     "  /ultimos [n]                      - ultimas entradas del ledger local\n"
     "  /buscar <texto>                   - busca en el ledger local\n"
+    "  /retry                            - reintenta sync de entradas pendientes con Firefly\n"
     "\n"
     "Adjunta un CSV de Mercado Pago (statement o Date,Description,Amount,External_ID) "
     "y lo importo a Firefly.\n"
@@ -134,6 +133,10 @@ def _format_ledger_rows(rows) -> str:
     return "\n".join(lines)
 
 
+_last_call: dict[int, float] = {}
+_RATE_LIMIT_S = 1.0
+
+
 def _is_allowed(update: Update) -> bool:
     chat_id = update.effective_chat.id if update.effective_chat else None
     if not ALLOWED_CHATS:
@@ -142,11 +145,20 @@ def _is_allowed(update: Update) -> bool:
 
 
 async def _guard(update: Update) -> bool:
-    if _is_allowed(update):
-        return True
-    log.warning("Chat no autorizado: %s", update.effective_chat.id)
-    await update.message.reply_text("Chat no autorizado.")
-    return False
+    chat = update.effective_chat
+    if not _is_allowed(update):
+        log.warning("Chat no autorizado: %s", chat.id if chat else "?")
+        if update.message:
+            await update.message.reply_text("Chat no autorizado.")
+        return False
+    if chat:
+        now = time.monotonic()
+        if now - _last_call.get(chat.id, 0.0) < _RATE_LIMIT_S:
+            if update.message:
+                await update.message.reply_text("Muchos mensajes seguidos, espera un momento.")
+            return False
+        _last_call[chat.id] = now
+    return True
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -156,6 +168,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _guard(update):
+        return
     chat = update.effective_chat
     user = update.effective_user
     await update.message.reply_text(
@@ -274,7 +288,7 @@ async def cmd_estado(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"- Gemini: {'configurado' if GEMINI_API_KEY else 'sin GEMINI_API_KEY'}",
         f"- Ledger: {ledger.path}",
         f"- Entradas NL/manuales: {stats['entries']}",
-        f"- Pendientes sin Firefly ID: {stats['unsynced']}",
+        f"- Pendientes de sync: {stats['unsynced']}",
         f"- Imports registrados: {stats['imports']}",
         f"- Filas de import con error: {stats['import_errors']}",
     ]
@@ -354,6 +368,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "import_csv",
         status="ok" if result.errors == 0 else "partial",
         message=summary,
+        chat_id=msg.chat_id,
+        user_id=update.effective_user.id if update.effective_user else None,
+        username=(update.effective_user.username or "") if update.effective_user else "",
     )
     log.info("Resultado:\n%s", summary)
     await msg.reply_text(f"```\n{summary}\n```", parse_mode="Markdown")
@@ -440,17 +457,51 @@ async def handle_other(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             )
             return
 
-        parsed = await asyncio.to_thread(
-            parse_expense,
+        parsed_result = await asyncio.to_thread(
+            parse_expenses,
             text,
             gemini_api_key=GEMINI_API_KEY,
             model=GEMINI_MODEL,
             categories=cats,
             account_aliases=[a for a in ASSET_ACCOUNTS if a != "default"],
+            default_currency=CURRENCY,
         )
-        if parsed.amount == 0:
+        if not parsed_result.transactions or all(p.amount == 0 for p in parsed_result.transactions):
             await update.message.reply_text(
                 "No detecte un monto. Ej: '7000 chino' o 'ayer 15k nafta'."
+            )
+            return
+        if parsed_result.needs_confirmation:
+            context.chat_data["pending_nl_confirm"] = {
+                "transactions": parsed_result.transactions,
+            }
+            preview = _format_parse_preview(parsed_result.transactions, parsed_result.warnings)
+            keyboard = InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton("Confirmar", callback_data="nlconfirm:ok"),
+                        InlineKeyboardButton("Cancelar", callback_data="nlconfirm:cancel"),
+                    ]
+                ]
+            )
+            await update.message.reply_text(
+                "Necesito confirmacion antes de guardar:\n"
+                f"```\n{preview}\n```",
+                parse_mode="Markdown",
+                reply_markup=keyboard,
+            )
+            return
+
+        parsed = parsed_result.transactions[0]
+        if len(parsed_result.transactions) > 1:
+            results = []
+            for item in parsed_result.transactions:
+                result = await _do_record(item)
+                results.append(result)
+                await _record_operation_for_update(update, result)
+            await update.message.reply_text(
+                "```\n" + "\n\n".join(r.summary() for r in results) + "\n```",
+                parse_mode="Markdown",
             )
             return
 
@@ -486,13 +537,7 @@ async def handle_other(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             return
 
         result = await _do_record(parsed)
-        await asyncio.to_thread(
-            ledger.record_operation,
-            result.action,
-            row=result.row,
-            status="ok",
-            message=result.message,
-        )
+        await _record_operation_for_update(update, result)
     except FireflyError as e:
         await update.message.reply_text(f"Firefly error: {e}")
         return
@@ -536,6 +581,39 @@ async def cmd_deshacer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         row=removed,
         status="ok",
         message="\n".join(parts),
+        chat_id=update.effective_chat.id if update.effective_chat else None,
+        user_id=update.effective_user.id if update.effective_user else None,
+        username=(update.effective_user.username or "") if update.effective_user else "",
+    )
+    await update.message.reply_text("\n".join(parts))
+
+
+async def cmd_retry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _guard(update):
+        return
+    pending = await asyncio.to_thread(ledger.get_unsynced)
+    if not pending:
+        await update.message.reply_text("No hay entradas pendientes de sync con Firefly.")
+        return
+    await update.message.reply_text(f"Reintentando sync de {len(pending)} entrada(s)...")
+    ok, failed = await asyncio.to_thread(
+        ledger.retry_sync,
+        client,
+        asset_id=ASSET_ID,
+        asset_accounts=ASSET_ACCOUNTS,
+        currency=CURRENCY,
+    )
+    parts = ["Retry completado:", f"  Sincronizadas: {ok}"]
+    if failed:
+        parts.append(f"  Fallidas (Firefly no respondio): {failed}")
+    await asyncio.to_thread(
+        ledger.record_operation,
+        "retry_sync",
+        status="ok" if not failed else "partial",
+        message=f"ok={ok} failed={failed}",
+        chat_id=update.effective_chat.id if update.effective_chat else None,
+        user_id=update.effective_user.id if update.effective_user else None,
+        username=(update.effective_user.username or "") if update.effective_user else "",
     )
     await update.message.reply_text("\n".join(parts))
 
@@ -555,8 +633,10 @@ def main() -> None:
     app.add_handler(CommandHandler("estado", cmd_estado))
     app.add_handler(CommandHandler("ultimos", cmd_ultimos))
     app.add_handler(CommandHandler("buscar", cmd_buscar))
+    app.add_handler(CommandHandler("retry", cmd_retry))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_other))
+    app.add_handler(CallbackQueryHandler(on_nl_confirm, pattern=r"^nlconfirm:"))
     app.add_handler(CallbackQueryHandler(on_cat_confirm, pattern=r"^nlcat:"))
 
     log.info("Bot iniciado. Chats autorizados: %s", ALLOWED_CHATS or "(bloqueado - configurar ALLOWED_CHATS)")
@@ -593,6 +673,9 @@ async def on_cat_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             row=result.row,
             status="ok",
             message=result.message,
+            chat_id=query.message.chat_id if query.message else None,
+            user_id=query.from_user.id if query.from_user else None,
+            username=(query.from_user.username or "") if query.from_user else "",
         )
     except FireflyError as e:
         await query.edit_message_text(f"Firefly error: {e}")
@@ -605,6 +688,48 @@ async def on_cat_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await query.edit_message_text(f"```\n{result.summary()}\n```", parse_mode="Markdown")
 
 
+async def on_nl_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ""
+    pending = context.chat_data.pop("pending_nl_confirm", None)
+    if not pending:
+        await query.edit_message_text("Sesion expirada. Manda el gasto de nuevo.")
+        return
+    if data == "nlconfirm:cancel":
+        await query.edit_message_text("Cancelado. No guarde nada.")
+        return
+    if data != "nlconfirm:ok":
+        await query.edit_message_text("Opcion no reconocida.")
+        return
+    try:
+        results = []
+        for parsed in pending["transactions"]:
+            result = await _do_record(parsed)
+            results.append(result)
+            await asyncio.to_thread(
+                ledger.record_operation,
+                result.action,
+                row=result.row,
+                status="ok",
+                message=result.message,
+                chat_id=query.message.chat_id if query.message else None,
+                user_id=query.from_user.id if query.from_user else None,
+                username=(query.from_user.username or "") if query.from_user else "",
+            )
+    except FireflyError as e:
+        await query.edit_message_text(f"Firefly error: {e}")
+        return
+    except Exception as e:
+        log.exception("NL confirm fallo")
+        await query.edit_message_text(f"Error: {e}")
+        return
+    await query.edit_message_text(
+        "```\n" + "\n\n".join(r.summary() for r in results) + "\n```",
+        parse_mode="Markdown",
+    )
+
+
 async def _do_record(parsed) -> "RecordResult":
     return await asyncio.to_thread(
         record_expense,
@@ -615,6 +740,40 @@ async def _do_record(parsed) -> "RecordResult":
         asset_accounts=ASSET_ACCOUNTS,
         currency=CURRENCY,
     )
+
+
+async def _record_operation_for_update(update: Update, result) -> None:
+    await asyncio.to_thread(
+        ledger.record_operation,
+        result.action,
+        row=result.row,
+        status="ok",
+        message=result.message,
+        chat_id=update.effective_chat.id if update.effective_chat else None,
+        user_id=update.effective_user.id if update.effective_user else None,
+        username=(update.effective_user.username or "") if update.effective_user else "",
+    )
+
+
+def _format_parse_preview(transactions, warnings: list[str]) -> str:
+    lines = []
+    for i, item in enumerate(transactions, 1):
+        direction = "=>" if item.tx_type == "transferencia" else "+" if item.amount > 0 else "-"
+        cat = item.category or "(sin categoria)"
+        accounts = f" {item.account}" if item.account else ""
+        if item.account_dest:
+            accounts += f" => {item.account_dest}"
+        lines.append(
+            f"{i}. {item.date} {direction}{item.currency} {abs(item.amount):,.2f} "
+            f"{item.description} [{cat}]{accounts}"
+        )
+        for warning in item.warnings:
+            lines.append(f"   ! {warning}")
+    seen = {w for tx in transactions for w in tx.warnings}
+    for warning in warnings:
+        if warning not in seen:
+            lines.append(f"! {warning}")
+    return "\n".join(lines)
 
 
 if __name__ == "__main__":

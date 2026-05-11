@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -14,6 +15,8 @@ from retry_utils import call_with_retries
 
 
 log = logging.getLogger(__name__)
+
+_MAX_TAG_WORKERS = 8
 
 
 SYSTEM_PROMPT = (
@@ -155,46 +158,57 @@ def categorize_pending(
         res.details.append(f"respuesta IA invalida (len={len(data) if isinstance(data, list) else '?'})")
         return res
 
-    # 4. mapear nombre -> categoria y actualizar Firefly
+    # 4. mapear nombre -> categoria y actualizar Firefly en paralelo
     cats_map = {c.lower(): c for c in cats}
-    for tx, cat_name in zip(txs, data):
-        tid = tx["id"]
-        original_desc = tx["description"][:50]
-        canonical = (cat_name or "").strip()
-
-        if not canonical:
+    with ThreadPoolExecutor(max_workers=_MAX_TAG_WORKERS) as pool:
+        futures = {
+            pool.submit(_apply_one, client, tx["id"], (cat_name or "").strip(), cats_map): tx
+            for tx, cat_name in zip(txs, data)
+        }
+        for future in as_completed(futures):
+            tx = futures[future]
+            tid = tx["id"]
+            original_desc = tx["description"][:50]
             try:
-                _add_tag(client, tid, "ai-miss")
-                res.unknown += 1
-                res.details.append(f"UNKNOWN: {original_desc}")
+                action, extra = future.result()
+                if action == "classified":
+                    res.classified += 1
+                    log.info("  + #%s '%s' -> %s", tid, original_desc, extra)
+                else:
+                    res.unknown += 1
+                    if extra:
+                        res.details.append(f"NUEVA (sin confirmar): {original_desc} -> {extra}")
+                        if extra not in res.proposed_new:
+                            res.proposed_new.append(extra)
+                    else:
+                        res.details.append(f"UNKNOWN: {original_desc}")
             except Exception as e:
                 res.errors += 1
-                res.details.append(f"err tag #{tid}: {e}")
-            continue
-
-        if canonical.lower() not in cats_map:
-            try:
-                _add_tag(client, tid, "ai-miss")
-                res.unknown += 1
-                res.details.append(f"NUEVA (sin confirmar): {original_desc} -> {canonical}")
-                if canonical not in res.proposed_new:
-                    res.proposed_new.append(canonical)
-            except Exception as e:
-                res.errors += 1
-                res.details.append(f"err tag #{tid}: {e}")
-            continue
-
-        try:
-            firefly_cat = cats_map[canonical.lower()]
-            client.update_transaction_category(tid, firefly_cat)
-            _add_tag(client, tid, "ai-classified")
-            res.classified += 1
-            log.info("  + #%s '%s' -> %s", tid, original_desc, firefly_cat)
-        except Exception as e:
-            res.errors += 1
-            res.details.append(f"err update #{tid}: {e}")
+                res.details.append(f"err #{tid}: {e}")
 
     return res
+
+
+def _apply_one(
+    client: FireflyClient,
+    tid: str,
+    canonical: str,
+    cats_map: dict[str, str],
+) -> tuple[str, str]:
+    """Aplica categoria/tag a una transaccion. Thread-safe (sin estado compartido).
+
+    Retorna (action, extra):
+      action='classified' -> extra = nombre de categoria aplicado
+      action='unknown'    -> extra = categoria propuesta (vacio si la IA no supo)
+    """
+    if not canonical or canonical.lower() not in cats_map:
+        _add_tag(client, tid, "ai-miss")
+        proposed = canonical if canonical and canonical.lower() not in cats_map else ""
+        return ("unknown", proposed)
+    firefly_cat = cats_map[canonical.lower()]
+    client.update_transaction_category(tid, firefly_cat)
+    _add_tag(client, tid, "ai-classified")
+    return ("classified", firefly_cat)
 
 
 def _add_tag(client: FireflyClient, group_id: str, tag: str) -> None:

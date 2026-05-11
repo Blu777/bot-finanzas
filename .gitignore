@@ -3,6 +3,26 @@ mp-sync/logs/
 __pycache__/
 *.pyc
 .venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Variables de entorno y datos locales.
+.env
+.env.*
+*.sqlite
+*.sqlite3
+*.db
+*.csv
+
+# Notas/transcripts locales de trabajo.
+Implement Rule-Based NL Parser.md
+
+# Tests locales.
+mp-sync/tests/
+mp-sync/pyproject.toml
 
 # Composes con secretos reales (NO subir a GitHub).
 docker-compose.yml
