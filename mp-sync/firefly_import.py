@@ -103,6 +103,16 @@ def _normalize_date(value: str) -> str:
 
 def _detect_dialect(text: str) -> csv.Dialect:
     sample = text[:4096]
+    first_line = sample.splitlines()[0] if sample else ""
+    if ";" in first_line and first_line.count(";") >= 2:
+
+        class _Semi(csv.Dialect):
+            delimiter = ";"
+            quotechar = '"'
+            lineterminator = "\r\n"
+            quoting = csv.QUOTE_MINIMAL
+
+        return _Semi()
     try:
         return csv.Sniffer().sniff(sample, delimiters=",;\t")
     except csv.Error:
