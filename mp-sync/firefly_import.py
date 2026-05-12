@@ -57,6 +57,11 @@ def _post_tx(client: FireflyClient, asset_id: int, currency: str, row: dict) -> 
     desc = (row["Description"] or "").strip() or "Mercado Pago"
     date = row["Date"].strip()
 
+    # Fallback: buscar duplicado por fecha + monto + descripcion
+    if client.find_duplicate(date, row["Amount"], desc):
+        log.info("Duplicado detectado por fecha/monto/desc: %s %s %s", date, amount, desc)
+        return "skip"
+
     tx: dict = {
         "type": "withdrawal" if is_withdrawal else "deposit",
         "date": date,

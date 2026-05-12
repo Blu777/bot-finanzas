@@ -101,13 +101,49 @@ class FireflyClient:
             "GET",
             "/api/v1/search/transactions",
             headers={"Authorization": f"Bearer {self.token}", "Accept": "application/json"},
-            params={"query": f"external_id:{external_id}"},
+            params={"query": f'external_id:"{external_id}"'},
         )
         if r.status_code != 200:
             raise FireflyError(
                 f"search external_id:{external_id} -> {r.status_code}: {r.text[:300]}"
             )
         return len(r.json().get("data", [])) > 0
+
+    def find_duplicate(self, date: str, amount: str, description: str) -> bool:
+        """Busca transacciones del mismo dia con mismo monto (abs).
+        Si hay varias con el mismo monto, usa la descripcion como desambiguacion.
+        """
+        r = self._request(
+            "GET",
+            "/api/v1/transactions",
+            headers=self._h(),
+            params={"start": date, "end": date, "limit": 100},
+        )
+        if r.status_code != 200:
+            raise FireflyError(f"GET transactions -> {r.status_code}: {r.text[:300]}")
+
+        amount_f = abs(float(amount))
+        desc_lower = description.lower().strip()
+        candidates = []
+
+        for tx in r.json().get("data", []):
+            for journal in tx.get("attributes", {}).get("transactions", []):
+                j_date = (journal.get("date") or "")[:10]
+                j_amount = abs(float(journal.get("amount", "0")))
+                if j_date == date and j_amount == amount_f:
+                    j_desc = (journal.get("description") or "").lower().strip()
+                    candidates.append(j_desc)
+
+        if not candidates:
+            return False
+        if len(candidates) == 1:
+            return True
+
+        # Si hay varias, busca overlap en descripciones
+        for j_desc in candidates:
+            if desc_lower in j_desc or j_desc in desc_lower:
+                return True
+        return False
 
     def create_transaction(self, payload: dict) -> dict:
         return self._post("/api/v1/transactions", payload)
