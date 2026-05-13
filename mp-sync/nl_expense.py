@@ -258,7 +258,7 @@ _INSTALLMENTS_RE = re.compile(r"\b(?:en\s+)?(\d{1,2})\s*(?:cuotas?|x)\b|\bcuota\
 _CATEGORY_HINTS: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
     (("uber", "cabify", "taxi", "nafta", "ypf", "shell", "peaje"), ("Transporte", "Auto")),
     (("sushi", "restaurant", "restaurante", "delivery", "pizza", "cafe", "bar"), ("Restaurantes", "Comida", "Salidas")),
-    (("super", "supermercado", "chino", "verduleria", "carniceria"), ("Supermercado", "Comida")),
+    (("super", "supermercado", "chino", "verduleria", "carniceria", "mayonesa", "pan", "leche", "huevos", "queso", "yerba", "azucar", "arroz", "fideos", "galletitas"), ("Supermercado", "Comida")),
     (("alquiler", "expensas"), ("Vivienda", "Alquiler")),
     (("sueldo", "honorarios"), ("Ingresos", "Sueldo")),
 )
@@ -585,9 +585,11 @@ def parse_expense(
             return rule_result.transactions[0]
     quick = _try_quick_parse(text, today, categories)
     if quick is not None:
-        log.debug("quick-parse ok (LLM skipped): %r -> %.2f desc=%r", text, quick.amount, quick.description)
-        quick.currency = default_currency
-        return quick
+        if quick.category:
+            log.debug("quick-parse ok (LLM skipped): %r -> %.2f desc=%r", text, quick.amount, quick.description)
+            quick.currency = default_currency
+            return quick
+        log.debug("quick-parse sin categoria; fallback a Gemini: %r", text)
     account_aliases = account_aliases or []
     prompt = (
         f"Hoy: {today.isoformat()}\n"
