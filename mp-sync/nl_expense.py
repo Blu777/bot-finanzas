@@ -259,6 +259,7 @@ _CATEGORY_HINTS: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
     (("uber", "cabify", "taxi", "nafta", "ypf", "shell", "peaje"), ("Transporte", "Auto")),
     (("sushi", "restaurant", "restaurante", "delivery", "pizza", "cafe", "bar"), ("Restaurantes", "Comida", "Salidas")),
     (("super", "supermercado", "chino", "verduleria", "carniceria", "mayonesa", "pan", "leche", "huevos", "queso", "yerba", "azucar", "arroz", "fideos", "galletitas"), ("Supermercado", "Comida")),
+    (("peluqueria", "peluquero", "barberia", "barbero", "corte"), ("Peluquería", "Peluqueria", "Barbería", "Barberia", "Cuidado personal", "Personal")),
     (("alquiler", "expensas"), ("Vivienda", "Alquiler")),
     (("sueldo", "honorarios"), ("Ingresos", "Sueldo")),
 )
@@ -541,10 +542,19 @@ def parse_expenses(
                 break
             parsed.append(item)
     if parsed:
-        needs_confirmation = len(parsed) > 1 or any(p.needs_confirmation for p in parsed)
-        warnings = [w for p in parsed for w in p.warnings]
-        confidence = min(p.confidence for p in parsed)
-        return ParseResult(parsed, confidence, needs_confirmation, warnings)
+        if (
+            len(parsed) == 1
+            and parsed[0].tx_type == "gasto"
+            and not parsed[0].needs_confirmation
+            and categories
+            and not parsed[0].category
+        ):
+            log.debug("rule-parse sin categoria; fallback a Gemini: %r", text)
+        else:
+            needs_confirmation = len(parsed) > 1 or any(p.needs_confirmation for p in parsed)
+            warnings = [w for p in parsed for w in p.warnings]
+            confidence = min(p.confidence for p in parsed)
+            return ParseResult(parsed, confidence, needs_confirmation, warnings)
     one = parse_expense(
         text,
         gemini_api_key=gemini_api_key,
@@ -585,7 +595,7 @@ def parse_expense(
             return rule_result.transactions[0]
     quick = _try_quick_parse(text, today, categories)
     if quick is not None:
-        if quick.category:
+        if quick.category or quick.tx_type != "gasto" or not categories:
             log.debug("quick-parse ok (LLM skipped): %r -> %.2f desc=%r", text, quick.amount, quick.description)
             quick.currency = default_currency
             return quick
