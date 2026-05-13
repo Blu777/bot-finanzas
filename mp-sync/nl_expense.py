@@ -256,12 +256,50 @@ _EXPENSE_RE = re.compile(r"\b(?:gast[eé]|pagu[eé]|compr[eé]|mand[eé]|transfe
 _TRANSFER_RE = re.compile(r"\b(?:transfer(?:i|í|encia)|pas[eé]|mov[ií]|retir[eé]|saqu[eé]|extracci[oó]n|deposit[eé])\b", re.IGNORECASE)
 _INSTALLMENTS_RE = re.compile(r"\b(?:en\s+)?(\d{1,2})\s*(?:cuotas?|x)\b|\bcuota\s+(\d{1,2})\s*/\s*(\d{1,2})\b", re.IGNORECASE)
 _CATEGORY_HINTS: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
-    (("uber", "cabify", "taxi", "nafta", "ypf", "shell", "peaje"), ("Transporte", "Auto")),
-    (("sushi", "restaurant", "restaurante", "delivery", "pizzeria", "cafe", "bar"), ("Restaurantes", "Comida", "Salidas")),
-    (("super", "supermercado", "chino", "verduleria", "carniceria", "mayonesa", "pan", "leche", "huevos", "queso", "yerba", "azucar", "arroz", "fideos", "galletitas", "milanesa", "milanesas", "pollo", "carne", "verdura", "fruta"), ("Supermercado", "Comida")),
-    (("peluqueria", "peluquero", "barberia", "barbero", "corte"), ("Peluquería", "Peluqueria", "Barbería", "Barberia", "Cuidado personal", "Personal")),
-    (("alquiler", "expensas"), ("Vivienda", "Alquiler")),
-    (("sueldo", "honorarios"), ("Ingresos", "Sueldo")),
+    # Transporte
+    (("uber", "cabify", "taxi", "nafta", "ypf", "shell", "axion", "peaje", "sube", "colectivo", "subte", "estacionamiento"), ("Transporte",)),
+    # Delivery
+    (("delivery", "pedido", "rappi", "pedidosya", "glovo"), ("Delivery",)),
+    # Salidas (restaurantes, bares, comida fuera)
+    (("sushi", "restaurant", "restaurante", "pizzeria", "cafe", "bar", "restoran", "bodegon", "cantina", "hamburgueseria"), ("Salidas",)),
+    # Supermercado
+    (("super", "supermercado", "chino", "verduleria", "carniceria", "almacen", "kiosco", "mayorista", "carrefour", "coto", "disco", "jumbo", "dia", "changomas", "mayonesa", "pan", "leche", "huevos", "queso", "yerba", "azucar", "arroz", "fideos", "galletitas", "milanesa", "milanesas", "pollo", "carne", "verdura", "fruta", "aceite", "manteca"), ("Supermercado",)),
+    # Comida Trabajo
+    (("hestia", "toldito", "vianda", "almuerzo trabajo", "comida trabajo"), ("Comida Trabajo",)),
+    # Personal (peluqueria, cuidado personal)
+    (("peluqueria", "peluquero", "barberia", "barbero", "corte de pelo", "estetica", "manicuria", "depilacion", "spa"), ("Personal",)),
+    # Farmacia / salud
+    (("farmacia", "farma", "medicamento", "remedio", "medico", "doctor", "clinica", "hospital", "laboratorio", "dentista"), ("Farmacia",)),
+    # Deportes
+    (("gym", "gimnasio", "cancha", "pileta", "natacion", "deporte", "rugby", "tenis", "padel", "running", "fitness"), ("Deportes",)),
+    # Futbol
+    (("futbol", "pelota", "botines", "cuota futbol", "river", "boca", "racing", "independiente"), ("Futbol",)),
+    # Servicios
+    (("luz", "edesur", "edenor", "gas", "metrogas", "agua", "aysa", "internet", "fibertel", "telecentro", "personal", "movistar", "claro", "telefono", "celular", "cablevision"), ("Servicios",)),
+    # Subscripciones
+    (("netflix", "spotify", "disney", "hbo", "amazon prime", "youtube", "apple", "icloud", "openai", "chatgpt"), ("Subscripciones",)),
+    # Compras online
+    (("mercadolibre", "meli", "amazon", "aliexpress", "tiendamia", "shein"), ("Compras online",)),
+    # Alquiler+Expensas
+    (("alquiler", "expensas", "consorcio"), ("Alquiler+Expensas",)),
+    # Prestamos
+    (("prestamo", "cuota prestamo", "devolucion prestamo", "fondo"), ("Prestamos",)),
+    # Inversiones
+    (("inversion", "plazo fijo", "fci", "dolar", "cripto", "bitcoin", "cedear", "accion", "bono"), ("Inversiones",)),
+    # Transferencias
+    (("transferencia", "transferi", "mande plata"), ("Transferencias",)),
+    # Movimientos Internos
+    (("recarga", "extraje", "retiro", "deposito efectivo", "dinero disponible"), ("Movimientos Internos",)),
+    # Sueldo / ingresos
+    (("sueldo", "honorarios", "cobro", "salario"), ("Sueldo",)),
+    # Regalos
+    (("regalo", "regalos", "presente", "cumple", "cumpleanos", "navidad", "flores"), ("Regalos",)),
+    # Salud (medicos, turnos, analisis - distinto de farmacia/remedios)
+    (("medico", "doctor", "turno medico", "clinica", "hospital", "laboratorio", "dentista", "odontologo", "kinesiologo", "psicologo", "terapeuta", "analisis", "radiografia", "prepaga", "obra social"), ("Salud",)),
+    # Educacion
+    (("curso", "capacitacion", "libro", "libros", "universidad", "colegio", "instituto", "clases", "udemy", "coursera", "educacion", "material escolar"), ("Educación",)),
+    # Ropa
+    (("ropa", "remera", "pantalon", "zapatillas", "calzado", "camisa", "vestido", "abrigo", "campera", "buzo", "remerita", "indumentaria", "zara", "h&m", "adidas", "nike"), ("Ropa",)),
 )
 _CURRENCY_ALIASES = {
     "$": "ARS",
@@ -387,6 +425,23 @@ def _canonical_category(description: str, categories: list[str]) -> str:
     return ""
 
 
+def _strip_account_alias(desc: str, alias: str) -> str:
+    """Elimina el alias de cuenta de la descripcion (case/accent-insensitive, palabra completa)."""
+    if not alias:
+        return desc
+    pattern = rf"\b{re.escape(_strip_accents(alias))}\b"
+    cleaned = re.sub(pattern, " ", _strip_accents(desc), flags=re.IGNORECASE)
+    # reconstruir con casing original usando posiciones
+    # mas simple: aplicar el patron directamente sobre desc con acento-strip solo en el patron
+    cleaned = re.sub(
+        rf"(?i)\b{re.escape(alias)}\b", " ", desc
+    )
+    # fallback sin acentos
+    if alias.lower() in desc.lower():
+        cleaned = re.sub(rf"(?i)\b{re.escape(alias)}\b", " ", desc)
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
 def _strip_parser_noise(segment: str, amount_match: re.Match) -> str:
     before = segment[: amount_match.start()].strip()
     after = segment[amount_match.end() :].strip()
@@ -492,6 +547,8 @@ def _try_rule_parse_one(
         warnings.append("Cuotas detectadas; revisar antes de guardar.")
         needs_confirmation = True
         confidence = min(confidence, 0.82)
+    if account:
+        desc_raw = _strip_account_alias(desc_raw, account)
     description = _title_description(desc_raw)
     category = _canonical_category(f"{description} {desc_norm}", categories)
     amount = float(value)

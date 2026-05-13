@@ -90,6 +90,22 @@ SEED: list[tuple[str, str]] = [
     ("dinero retirado", "Movimientos internos"),
     ("dinero devuelto", "Movimientos internos"),
     ("dinero disponible", "Movimientos internos"),
+    # Regalos
+    ("regalo", "Regalos"),
+    ("flores", "Regalos"),
+    # Salud
+    ("prepaga", "Salud"),
+    ("obra social", "Salud"),
+    ("osde", "Salud"),
+    ("swiss medical", "Salud"),
+    ("medife", "Salud"),
+    # Educacion
+    ("udemy", "Educación"),
+    ("coursera", "Educación"),
+    # Ropa
+    ("zara", "Ropa"),
+    ("adidas", "Ropa"),
+    ("nike", "Ropa"),
     # Overrides de personas conocidas (deben ir DESPUES de "transferencia ..."
     # para que set_category sobreescriba al de Transferencias).
     ("paloma", "Supermercado"),  # super chino del barrio
