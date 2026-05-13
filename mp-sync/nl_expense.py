@@ -1508,6 +1508,17 @@ def record_expense(
     )
 
 
+def _firefly_transaction_date(row_date: str) -> str:
+    try:
+        parsed = datetime.strptime(row_date[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return row_date
+    now = datetime.now().astimezone()
+    if parsed == now.date():
+        return now.isoformat(timespec="seconds")
+    return datetime.combine(parsed, datetime.min.time()).astimezone().isoformat(timespec="seconds")
+
+
 def _push_firefly(
     row: LedgerRow,
     *,
@@ -1524,6 +1535,7 @@ def _push_firefly(
     )
     amount_abs = f"{abs(row.amount):.2f}"
     desc = row.description or ("Gasto" if is_withdrawal else "Ingreso")
+    tx_date = _firefly_transaction_date(row.date)
 
     if row.tx_type == "transferencia":
         dest_id = resolve_asset_account_id(
@@ -1533,7 +1545,7 @@ def _push_firefly(
         )
         tx: dict = {
             "type": "transfer",
-            "date": row.date,
+            "date": tx_date,
             "amount": amount_abs,
             "currency_code": currency,
             "description": desc,
@@ -1545,7 +1557,7 @@ def _push_firefly(
     else:
         tx: dict = {
             "type": "withdrawal" if is_withdrawal else "deposit",
-            "date": row.date,
+            "date": tx_date,
             "amount": amount_abs,
             "currency_code": currency,
             "description": desc,
