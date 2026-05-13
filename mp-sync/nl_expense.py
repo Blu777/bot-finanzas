@@ -181,7 +181,7 @@ _QP_MULTIPLIERS: dict[str, int] = {"k": 1_000, "lucas": 1_000, "palo": 1_000_000
 _QP_STRIP_RE = re.compile(r"\bhoy\b", re.IGNORECASE)
 
 
-def _try_quick_parse(text: str, today: date) -> ParsedExpense | None:
+def _try_quick_parse(text: str, today: date, categories: list[str] | None = None) -> ParsedExpense | None:
     """Parsea expresiones simples (entero + descripcion) sin llamar a Gemini.
 
     Retorna None si el texto es ambiguo, contiene fechas relativas o decimales.
@@ -220,10 +220,11 @@ def _try_quick_parse(text: str, today: date) -> ParsedExpense | None:
     else:
         tx_type = "gasto"
         signed_amount = -amount
+    category = _canonical_category(description, categories or [])
     return ParsedExpense(
         amount=signed_amount,
         description=description,
-        category="",
+        category=category,
         date=today.isoformat(),
         tx_type=tx_type,
     )
@@ -582,7 +583,7 @@ def parse_expense(
         )
         if rule_result.transactions:
             return rule_result.transactions[0]
-    quick = _try_quick_parse(text, today)
+    quick = _try_quick_parse(text, today, categories)
     if quick is not None:
         log.debug("quick-parse ok (LLM skipped): %r -> %.2f desc=%r", text, quick.amount, quick.description)
         quick.currency = default_currency
@@ -1407,6 +1408,14 @@ def record_expense(
     )
 
     if match is not None:
+        if not match.category and parsed.category:
+            ledger.update_row(match._row_index, category=parsed.category)
+            match.category = parsed.category
+            if match.firefly_id:
+                try:
+                    firefly.update_transaction_category(match.firefly_id, parsed.category)
+                except FireflyError as e:
+                    log.error("Actualizar categoria en Firefly fallo (entry #%d): %s", match._row_index, e)
         if match.firefly_id:
             return RecordResult(
                 action="already_synced",
