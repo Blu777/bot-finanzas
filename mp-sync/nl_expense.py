@@ -257,8 +257,8 @@ _TRANSFER_RE = re.compile(r"\b(?:transfer(?:i|í|encia)|pas[eé]|mov[ií]|retir[
 _INSTALLMENTS_RE = re.compile(r"\b(?:en\s+)?(\d{1,2})\s*(?:cuotas?|x)\b|\bcuota\s+(\d{1,2})\s*/\s*(\d{1,2})\b", re.IGNORECASE)
 _CATEGORY_HINTS: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
     (("uber", "cabify", "taxi", "nafta", "ypf", "shell", "peaje"), ("Transporte", "Auto")),
-    (("sushi", "restaurant", "restaurante", "delivery", "pizza", "cafe", "bar"), ("Restaurantes", "Comida", "Salidas")),
-    (("super", "supermercado", "chino", "verduleria", "carniceria", "mayonesa", "pan", "leche", "huevos", "queso", "yerba", "azucar", "arroz", "fideos", "galletitas"), ("Supermercado", "Comida")),
+    (("sushi", "restaurant", "restaurante", "delivery", "pizzeria", "cafe", "bar"), ("Restaurantes", "Comida", "Salidas")),
+    (("super", "supermercado", "chino", "verduleria", "carniceria", "mayonesa", "pan", "leche", "huevos", "queso", "yerba", "azucar", "arroz", "fideos", "galletitas", "milanesa", "milanesas", "pollo", "carne", "verdura", "fruta"), ("Supermercado", "Comida")),
     (("peluqueria", "peluquero", "barberia", "barbero", "corte"), ("Peluquería", "Peluqueria", "Barbería", "Barberia", "Cuidado personal", "Personal")),
     (("alquiler", "expensas"), ("Vivienda", "Alquiler")),
     (("sueldo", "honorarios"), ("Ingresos", "Sueldo")),
