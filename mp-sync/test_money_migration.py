@@ -68,9 +68,9 @@ def test_money_utils():
     print(f"✓ fp1 == fp2 (case insensitive): {fp1 == fp2}")
     print(f"✓ fp1 != fp3 (different amount): {fp1 != fp3}")
     
-    # Test idempotency key
-    key1 = generate_idempotency_key("2024-01-15", 15000, "Test", "Banco", "gasto")
-    key2 = generate_idempotency_key("2024-01-15", 15000, "Test", "Banco", "gasto")
+    # Test idempotency key (now only uses date, amount, description)
+    key1 = generate_idempotency_key("2024-01-15", 15000, "Test")
+    key2 = generate_idempotency_key("2024-01-15", 15000, "Test")
     print(f"\n✓ Idempotency key deterministic: {key1 == key2}")
     print(f"  Key: {key1}")
 

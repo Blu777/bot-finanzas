@@ -15,6 +15,8 @@ import json
 import logging
 import re
 import sqlite3
+import threading
+import time
 import unicodedata
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -776,6 +778,7 @@ class LedgerRow:
     _row_index: int = -1         # id interno en SQLite
     tx_fingerprint: str = ""     # Unique constraint for duplicate prevention
     idempotency_key: str = ""    # For external API idempotency
+    sync_status: str = "pending" # "pending" | "synced" | "failed"
     
     @property
     def amount(self) -> float:
@@ -905,10 +908,28 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
     ),
     (
         3,
-        "backfill amount_cents from legacy amount column",
-        """
-        UPDATE ledger_entries SET amount_cents = CAST(ROUND(amount * 100) AS INTEGER) WHERE amount_cents IS NULL;
-        """,
+        "backfill amount_cents from legacy amount",
+        "UPDATE ledger_entries SET amount_cents = CAST(ROUND(amount * 100) AS INTEGER) WHERE amount_cents IS NULL",
+    ),
+    (
+        4,
+        "placeholder - tx_fingerprint backfilled by Ledger._backfill_fingerprints()",
+        "SELECT 1",
+    ),
+    (
+        5,
+        "placeholder - idempotency_key backfilled by Ledger._backfill_idempotency_keys()",
+        "SELECT 1",
+    ),
+    (
+        6,
+        "add sync_status column for reliable sync tracking",
+        "ALTER TABLE ledger_entries ADD COLUMN sync_status TEXT DEFAULT 'pending'",
+    ),
+    (
+        7,
+        "index on sync_status for efficient unsynced queries",
+        "CREATE INDEX IF NOT EXISTS idx_ledger_sync_status ON ledger_entries(sync_status)",
     ),
 ]
 
@@ -1000,6 +1021,7 @@ class Ledger:
             self._ensure_column(conn, "ledger_entries", "amount_cents", "INTEGER")
             self._ensure_column(conn, "ledger_entries", "tx_fingerprint", "TEXT")
             self._ensure_column(conn, "ledger_entries", "idempotency_key", "TEXT")
+            self._ensure_column(conn, "ledger_entries", "sync_status", "TEXT DEFAULT 'pending'")
             # Legacy index (kept for compatibility)
             conn.execute(
                 """
@@ -1094,6 +1116,52 @@ class Ledger:
                 """
             )
             _apply_pending_migrations(conn)
+            self._backfill_fingerprints(conn)
+            self._backfill_idempotency_keys(conn)
+
+    def _backfill_fingerprints(self, conn: sqlite3.Connection) -> None:
+        """Backfill fingerprints using Python (ensures consistency with runtime)."""
+        from money_utils import generate_fingerprint
+        
+        rows = conn.execute(
+            "SELECT id, date, amount_cents, description FROM ledger_entries WHERE tx_fingerprint IS NULL OR tx_fingerprint = ''"
+        ).fetchall()
+        
+        for row in rows:
+            fingerprint = generate_fingerprint(
+                row["date"] or "",
+                row["amount_cents"] or 0,
+                row["description"] or ""
+            )
+            conn.execute(
+                "UPDATE ledger_entries SET tx_fingerprint = ? WHERE id = ?",
+                (fingerprint, row["id"])
+            )
+        
+        if rows:
+            log.info("Backfilled fingerprints for %d rows", len(rows))
+
+    def _backfill_idempotency_keys(self, conn: sqlite3.Connection) -> None:
+        """Backfill idempotency keys using Python hashlib (SQLite lacks SHA256)."""
+        from money_utils import generate_idempotency_key
+        
+        rows = conn.execute(
+            "SELECT id, date, amount_cents, description FROM ledger_entries WHERE idempotency_key IS NULL OR idempotency_key = ''"
+        ).fetchall()
+        
+        for row in rows:
+            key = generate_idempotency_key(
+                row["date"] or "",
+                row["amount_cents"] or 0,
+                row["description"] or ""
+            )
+            conn.execute(
+                "UPDATE ledger_entries SET idempotency_key = ? WHERE id = ?",
+                (key, row["id"])
+            )
+        
+        if rows:
+            log.info("Backfilled idempotency keys for %d rows", len(rows))
 
     @staticmethod
     def _ensure_column(
@@ -1136,6 +1204,7 @@ class Ledger:
             _row_index=int(row["id"]),
             tx_fingerprint=(row["tx_fingerprint"] or "").strip(),
             idempotency_key=(row["idempotency_key"] or "").strip(),
+            sync_status=(row["sync_status"] or "pending").strip(),
         )
 
     def _migrate_legacy_csv(self) -> None:
@@ -1161,11 +1230,7 @@ class Ledger:
                     # Generate fingerprint for migrated data
                     from money_utils import generate_fingerprint, generate_idempotency_key
                     fingerprint = generate_fingerprint(date_str, amt_cents, desc_str)
-                    idempotency_key = generate_idempotency_key(
-                        date_str, amt_cents, desc_str,
-                        (row.get("account") or "").strip(),
-                        (row.get("tx_type") or "").strip()
-                    )
+                    idempotency_key = generate_idempotency_key(date_str, amt_cents, desc_str)
                     
                     rows.append(
                         (
@@ -1199,7 +1264,7 @@ class Ledger:
         with self._db() as conn:
             entry_count = conn.execute("SELECT COUNT(*) FROM ledger_entries").fetchone()[0]
             unsynced = conn.execute(
-                "SELECT COUNT(*) FROM ledger_entries WHERE firefly_id IN ('', 'sync_partial')"
+                "SELECT COUNT(*) FROM ledger_entries WHERE sync_status IN ('pending', 'failed')"
             ).fetchone()[0]
             import_count = conn.execute("SELECT COUNT(*) FROM import_batches").fetchone()[0]
             import_errors = conn.execute(
@@ -1213,15 +1278,15 @@ class Ledger:
             }
 
     def get_unsynced(self, limit: int = 50) -> list[LedgerRow]:
-        """Retorna entradas pendientes de sync: firefly_id vacio o 'sync_partial'."""
+        """Retorna entradas pendientes de sync: sync_status is 'pending' or 'failed'."""
         with self._db() as conn:
             rows = conn.execute(
                 """
                 SELECT id, date, description, amount, amount_cents, category, account, 
                        account_dest, currency, tx_type, source, firefly_id,
-                       tx_fingerprint, idempotency_key
+                       tx_fingerprint, idempotency_key, sync_status
                 FROM ledger_entries
-                WHERE firefly_id IN ('', 'sync_partial')
+                WHERE sync_status IN ('pending', 'failed')
                 ORDER BY id DESC
                 LIMIT ?
                 """,
@@ -1238,7 +1303,7 @@ class Ledger:
         currency: str = "ARS",
         limit: int = 50,
     ) -> tuple[int, int]:
-        """Reintenta sincronizar con Firefly las entradas con firefly_id vacío.
+        """Reintenta sincronizar con Firefly las entradas pending o failed.
 
         Retorna (ok, failed).
         """
@@ -1254,10 +1319,11 @@ class Ledger:
                     asset_accounts=asset_accounts,
                     currency=row.currency or currency,
                 )
-                self.update_row(row._row_index, firefly_id=fid)
+                self.update_row(row._row_index, firefly_id=fid, sync_status="synced")
                 log.info("retry_sync ok: entry #%d -> firefly#%s", row._row_index, fid)
                 ok += 1
             except FireflyError as e:
+                self.update_row(row._row_index, sync_status="failed")
                 log.error("retry_sync fallo para entry #%d: %s", row._row_index, e)
                 failed += 1
         return ok, failed
@@ -1268,7 +1334,7 @@ class Ledger:
                 """
                 SELECT id, date, description, amount, amount_cents, category, account, 
                        account_dest, currency, tx_type, source, firefly_id,
-                       tx_fingerprint, idempotency_key
+                       tx_fingerprint, idempotency_key, sync_status
                 FROM ledger_entries
                 ORDER BY id DESC
                 LIMIT ?
@@ -1284,7 +1350,7 @@ class Ledger:
                 """
                 SELECT id, date, description, amount, amount_cents, category, account, 
                        account_dest, currency, tx_type, source, firefly_id,
-                       tx_fingerprint, idempotency_key
+                       tx_fingerprint, idempotency_key, sync_status
                 FROM ledger_entries
                 WHERE description LIKE ? ESCAPE '\\' OR category LIKE ? ESCAPE '\\' OR firefly_id LIKE ? ESCAPE '\\'
                 ORDER BY id DESC
@@ -1492,9 +1558,7 @@ class Ledger:
         
         # Generate fingerprint for duplicate detection
         fingerprint = generate_fingerprint(row.date, row.amount_cents, row.description)
-        idempotency_key = generate_idempotency_key(
-            row.date, row.amount_cents, row.description, row.account, row.tx_type
-        )
+        idempotency_key = generate_idempotency_key(row.date, row.amount_cents, row.description)
         
         with self._db() as conn:
             # Use INSERT OR IGNORE with fingerprint as unique constraint
@@ -1503,8 +1567,8 @@ class Ledger:
                 """
                 INSERT OR IGNORE INTO ledger_entries
                 (date, description, amount, amount_cents, category, account, account_dest, 
-                 currency, tx_type, source, firefly_id, tx_fingerprint, idempotency_key)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 currency, tx_type, source, firefly_id, tx_fingerprint, idempotency_key, sync_status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     row.date,
@@ -1520,6 +1584,7 @@ class Ledger:
                     row.firefly_id,
                     fingerprint,
                     idempotency_key,
+                    row.sync_status,
                 ),
             )
             
@@ -1544,7 +1609,7 @@ class Ledger:
         allowed = {
             "date", "description", "amount", "amount_cents", "category", 
             "account", "account_dest", "currency", "tx_type", "source", 
-            "firefly_id", "tx_fingerprint", "idempotency_key"
+            "firefly_id", "tx_fingerprint", "idempotency_key", "sync_status"
         }
         updates = {k: v for k, v in fields.items() if k in allowed}
         if not updates:
@@ -1567,7 +1632,7 @@ class Ledger:
                 """
                 SELECT id, date, description, amount, amount_cents, category, account, 
                        account_dest, currency, tx_type, source, firefly_id,
-                       tx_fingerprint, idempotency_key
+                       tx_fingerprint, idempotency_key, sync_status
                 FROM ledger_entries
                 ORDER BY id DESC
                 LIMIT 1
@@ -1684,14 +1749,19 @@ def record_expense(
                 asset_accounts=asset_accounts,
                 currency=match.currency or currency,
             )
-            ledger.update_row(match._row_index, firefly_id=fid)
+            ledger.update_row(match._row_index, firefly_id=fid, sync_status="synced")
             match.firefly_id = fid
+            match.sync_status = "synced"
         except FireflyError as e:
+            ledger.update_row(match._row_index, sync_status="failed")
+            match.sync_status = "failed"
             log.error("Push a Firefly fallo (entry #%d csv, queda pendiente): %s", match._row_index, e)
+            # Trigger small retry batch in background
+            _trigger_background_retry(ledger, firefly, asset_id, asset_accounts, currency)
             return RecordResult(
                 action="sync_failed",
                 row=match,
-                message=f"Entrada en ledger. Firefly no respondio: {e}",
+                message=f"Entrada en ledger. Firefly no respondio: {e}. Reintento automatico programado.",
             )
         return RecordResult(
             action="synced_from_csv",
@@ -1744,15 +1814,21 @@ def record_expense(
             currency=new_row.currency or currency,
         )
         new_row.firefly_id = fid
-        ledger.update_row(idx, firefly_id=fid)
+        new_row.sync_status = "synced"
+        ledger.update_row(idx, firefly_id=fid, sync_status="synced")
     except FireflyError as e:
+        new_row.sync_status = "pending"
         log.error("Push a Firefly fallo (entry #%d queda pendiente de sync): %s", idx, e)
+        # Trigger small retry batch in background
+        _trigger_background_retry(ledger, firefly, asset_id, asset_accounts, currency)
         return RecordResult(
             action="created_pending",
             row=new_row,
-            message=f"Guardado localmente. Firefly no respondio: {e}",
+            message=f"Guardado localmente. Firefly no respondio: {e}. Reintento automatico en curso.",
         )
     
+    # Mark as synced if we got here (Firefly push succeeded)
+    new_row.sync_status = "synced"
     action = "created" if was_inserted else "synced_duplicate"
     return RecordResult(
         action=action,
@@ -1788,15 +1864,16 @@ def _push_firefly(
         asset_accounts,
         default_asset_id=asset_id,
     )
-    # Convert cents to decimal string for Firefly
+    # Convert cents to decimal string for Firefly using Decimal (exact conversion)
+    from decimal import Decimal, ROUND_HALF_UP
     amount_abs_cents = abs(row.amount_cents)
-    amount_abs = f"{amount_abs_cents // 100}.{amount_abs_cents % 100:02d}"
+    amount_abs = str((Decimal(amount_abs_cents) / Decimal(100)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
     desc = row.description or ("Gasto" if is_withdrawal else "Ingreso")
     tx_date = _firefly_transaction_date(row.date)
     
     # Generate idempotency key for external API call
     idempotency_key = row.idempotency_key or generate_idempotency_key(
-        row.date, row.amount_cents, row.description, row.account, row.tx_type
+        row.date, row.amount_cents, row.description
     )
 
     if row.tx_type == "transferencia":
@@ -1858,3 +1935,80 @@ def _push_firefly(
         "Respuesta inesperada de Firefly al crear transaccion. resp=%.300s", resp
     )
     return "sync_partial"
+
+
+# ---------------------------------------------------------------------------
+# Background Sync Worker
+# ---------------------------------------------------------------------------
+_background_worker_running = False
+_background_worker_lock = threading.Lock()
+
+def _trigger_background_retry(
+    ledger: Ledger,
+    firefly: FireflyClient,
+    asset_id: int,
+    asset_accounts: dict[str, int] | None,
+    currency: str,
+) -> None:
+    """Trigger a small retry batch in background thread."""
+    def retry_task():
+        try:
+            time.sleep(2)  # Wait 2 seconds before retry
+            ok, failed = ledger.retry_sync(
+                firefly,
+                asset_id=asset_id,
+                asset_accounts=asset_accounts,
+                currency=currency,
+                limit=5,  # Small batch
+            )
+            if ok > 0 or failed > 0:
+                log.info("Background retry completed: %d ok, %d failed", ok, failed)
+        except Exception as e:
+            log.error("Background retry failed: %s", e)
+    
+    thread = threading.Thread(target=retry_task, daemon=True)
+    thread.start()
+
+
+def start_background_sync_worker(
+    ledger: Ledger,
+    firefly: FireflyClient,
+    asset_id: int,
+    asset_accounts: dict[str, int] | None = None,
+    currency: str = "ARS",
+    interval_seconds: int = 300,  # 5 minutes
+) -> None:
+    """Start a background worker that retries unsynced entries every N seconds.
+    
+    Call this once at bot startup. Safe to call multiple times - it's a singleton.
+    """
+    global _background_worker_running
+    
+    with _background_worker_lock:
+        if _background_worker_running:
+            log.info("Background sync worker already running")
+            return
+        _background_worker_running = True
+    
+    def worker_loop():
+        log.info("Background sync worker started (interval=%ds)", interval_seconds)
+        while True:
+            try:
+                time.sleep(interval_seconds)
+                stats = ledger.stats()
+                if stats["unsynced"] > 0:
+                    log.info("Background sync: found %d unsynced entries", stats["unsynced"])
+                    ok, failed = ledger.retry_sync(
+                        firefly,
+                        asset_id=asset_id,
+                        asset_accounts=asset_accounts,
+                        currency=currency,
+                        limit=20,
+                    )
+                    log.info("Background sync completed: %d ok, %d failed", ok, failed)
+            except Exception as e:
+                log.error("Background sync worker error: %s", e)
+    
+    thread = threading.Thread(target=worker_loop, daemon=True, name="sync_worker")
+    thread.start()
+    log.info("Background sync worker thread started")

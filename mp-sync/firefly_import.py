@@ -61,13 +61,15 @@ def _post_tx(client: FireflyClient, asset_id: int, currency: str, row: dict) -> 
     
     is_withdrawal = amount_cents < 0
     amount_abs_cents = abs(amount_cents)
-    amount = f"{amount_abs_cents // 100}.{amount_abs_cents % 100:02d}"
+    # Use Decimal for exact conversion to string
+    from decimal import Decimal, ROUND_HALF_UP
+    amount = str((Decimal(amount_abs_cents) / Decimal(100)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
     desc = (row["Description"] or "").strip() or "Mercado Pago"
     date = row["Date"].strip()
 
     # Fallback: buscar duplicado por fecha + monto + descripcion
-    # Convert cents back to float string for Firefly client compatibility
-    if client.find_duplicate(date, str(amount_cents / 100), desc):
+    # Now uses integer cents for exact comparison
+    if client.find_duplicate(date, amount_cents, desc):
         log.info("Duplicado detectado por fecha/monto/desc: %s %s %s", date, amount, desc)
         return "skip"
 

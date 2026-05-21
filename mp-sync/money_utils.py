@@ -116,10 +116,14 @@ def generate_fingerprint(date_str: str, cents: int, description: str) -> str:
     return f"{date_str}|{cents}|{norm_desc}"
 
 
-def generate_idempotency_key(date_str: str, cents: int, description: str, 
-                              account: str = "", tx_type: str = "") -> str:
-    """Generate deterministic idempotency key for external API calls."""
+def generate_idempotency_key(date_str: str, cents: int, description: str) -> str:
+    """Generate deterministic idempotency key for external API calls.
+    
+    NOTE: Only uses date, amount, description - NOT account or tx_type.
+    This ensures the same transaction gets the same key regardless of
+    account inference changes or type classification.
+    """
     import hashlib
+    # Use fingerprint directly - already normalized
     fingerprint = generate_fingerprint(date_str, cents, description)
-    data = f"{fingerprint}|{account}|{tx_type}"
-    return hashlib.sha256(data.encode('utf-8')).hexdigest()[:32]
+    return hashlib.sha256(fingerprint.encode('utf-8')).hexdigest()[:32]

@@ -1,6 +1,7 @@
 """Cliente HTTP para la API de Firefly III. Usado por el importador y el bot."""
 from __future__ import annotations
 
+import decimal
 import logging
 from datetime import datetime, timedelta
 from typing import Iterable
@@ -110,9 +111,14 @@ class FireflyClient:
             )
         return len(r.json().get("data", [])) > 0
 
-    def find_duplicate(self, date: str, amount: str, description: str) -> bool:
+    def find_duplicate(self, date: str, amount_cents: int, description: str) -> bool:
         """Busca transacciones en una ventana de ±2 dias con mismo monto (abs).
         Usa keywords extraidas de la descripcion para desambiguar.
+        
+        Args:
+            date: Fecha en formato YYYY-MM-DD
+            amount_cents: Monto en centavos (ej: 15050 = $150.50)
+            description: Descripcion a comparar
         """
         date_obj = datetime.strptime(date, "%Y-%m-%d")
         start = (date_obj - timedelta(days=2)).date().isoformat()
@@ -127,7 +133,8 @@ class FireflyClient:
         if r.status_code != 200:
             raise FireflyError(f"GET transactions -> {r.status_code}: {r.text[:300]}")
 
-        amount_f = abs(float(amount))
+        # Compare using integer cents to avoid float precision issues
+        amount_cents_abs = abs(amount_cents)
         desc_lower = description.lower().strip()
 
         # Keywords significativas de la descripcion de MP (ignora palabras genericas)
@@ -141,11 +148,18 @@ class FireflyClient:
             if len(w) > 3 and w not in ignore
         }
 
+        from decimal import Decimal, ROUND_HALF_UP
+        
         candidates = []
         for tx in r.json().get("data", []):
             for journal in tx.get("attributes", {}).get("transactions", []):
-                j_amount = abs(float(journal.get("amount", "0")))
-                if j_amount != amount_f:
+                # Convert Firefly amount to cents using Decimal for exact comparison
+                try:
+                    j_amount = Decimal(str(journal.get("amount", "0")))
+                    j_amount_cents = int((j_amount * Decimal(100)).quantize(Decimal('1'), rounding=ROUND_HALF_UP))
+                except (ValueError, TypeError, decimal.InvalidOperation):
+                    continue
+                if j_amount_cents != amount_cents_abs:
                     continue
                 j_desc = (journal.get("description") or "").lower().strip()
                 candidates.append(j_desc)
