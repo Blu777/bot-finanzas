@@ -47,18 +47,27 @@ class ImportResult:
 
 
 def _post_tx(client: FireflyClient, asset_id: int, currency: str, row: dict) -> str:
+    from money_utils import parse_amount_to_cents, cents_to_display
+    
     eid = f"mp-{row['External_ID'].strip()}"
     if client.transaction_exists(eid):
         return "skip"
 
-    amount_raw = float(row["Amount"])
-    is_withdrawal = amount_raw < 0
-    amount = f"{abs(amount_raw):.2f}"
+    # Parse to cents for precise handling
+    amount_cents = parse_amount_to_cents(row["Amount"])
+    if amount_cents is None:
+        # Fallback: parse as float and convert
+        amount_cents = int(round(float(row["Amount"]) * 100))
+    
+    is_withdrawal = amount_cents < 0
+    amount_abs_cents = abs(amount_cents)
+    amount = f"{amount_abs_cents // 100}.{amount_abs_cents % 100:02d}"
     desc = (row["Description"] or "").strip() or "Mercado Pago"
     date = row["Date"].strip()
 
     # Fallback: buscar duplicado por fecha + monto + descripcion
-    if client.find_duplicate(date, row["Amount"], desc):
+    # Convert cents back to float string for Firefly client compatibility
+    if client.find_duplicate(date, str(amount_cents / 100), desc):
         log.info("Duplicado detectado por fecha/monto/desc: %s %s %s", date, amount, desc)
         return "skip"
 
@@ -89,11 +98,17 @@ def _post_tx(client: FireflyClient, asset_id: int, currency: str, row: dict) -> 
     return "ok"
 
 
-def _parse_amount(value: str) -> float:
+def _parse_amount(value: str) -> int:
+    """Parse amount to integer cents for precise handling."""
+    from money_utils import parse_amount_to_cents
+    cents = parse_amount_to_cents(value)
+    if cents is not None:
+        return cents
+    # Fallback
     raw = (value or "").strip()
     if "," in raw:
         raw = raw.replace(".", "").replace(",", ".")
-    return float(raw)
+    return int(round(float(raw) * 100))
 
 
 def _normalize_date(value: str) -> str:

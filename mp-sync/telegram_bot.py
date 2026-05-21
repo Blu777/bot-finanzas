@@ -119,15 +119,17 @@ HELP = (
 
 
 def _format_ledger_rows(rows) -> str:
+    from money_utils import cents_to_display
     if not rows:
         return "Sin resultados."
     lines = []
     for r in rows:
-        sign = "-" if r.amount < 0 else "+"
+        sign = "-" if r.amount_cents < 0 else "+"
         cat = r.category or "sin categoria"
         firefly = f" ff#{r.firefly_id}" if r.firefly_id else ""
+        amount_display = cents_to_display(abs(r.amount_cents), r.currency).lstrip('$').lstrip('US$')
         lines.append(
-            f"#{r._row_index} {r.date} {sign}${abs(r.amount):.2f} "
+            f"#{r._row_index} {r.date} {sign}${amount_display} "
             f"{r.description} [{cat}]{firefly}"
         )
     return "\n".join(lines)
@@ -466,7 +468,7 @@ async def handle_other(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             account_aliases=[a for a in ASSET_ACCOUNTS if a != "default"],
             default_currency=CURRENCY,
         )
-        if not parsed_result.transactions or all(p.amount == 0 for p in parsed_result.transactions):
+        if not parsed_result.transactions or all(p.amount_cents == 0 for p in parsed_result.transactions):
             await update.message.reply_text(
                 "No detecte un monto. Ej: '7000 chino' o 'ayer 15k nafta'."
             )
@@ -563,7 +565,9 @@ async def cmd_deshacer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if removed is None:
         await update.message.reply_text("No hay entradas en el ledger.")
         return
-    parts = [f"Borrado del ledger: {removed.date} {removed.description} ${removed.amount:.2f}"]
+    from money_utils import cents_to_display
+    amount_display = cents_to_display(removed.amount_cents, removed.currency)
+    parts = [f"Borrado del ledger: {removed.date} {removed.description} {amount_display}"]
     if removed.firefly_id:
         try:
             await asyncio.to_thread(client.delete_transaction, int(removed.firefly_id))
@@ -756,15 +760,17 @@ async def _record_operation_for_update(update: Update, result) -> None:
 
 
 def _format_parse_preview(transactions, warnings: list[str]) -> str:
+    from money_utils import cents_to_display
     lines = []
     for i, item in enumerate(transactions, 1):
-        direction = "=>" if item.tx_type == "transferencia" else "+" if item.amount > 0 else "-"
+        direction = "=>" if item.tx_type == "transferencia" else "+" if item.amount_cents > 0 else "-"
         cat = item.category or "(sin categoria)"
         accounts = f" {item.account}" if item.account else ""
         if item.account_dest:
             accounts += f" => {item.account_dest}"
+        amount_display = cents_to_display(abs(item.amount_cents), item.currency)
         lines.append(
-            f"{i}. {item.date} {direction}{item.currency} {abs(item.amount):,.2f} "
+            f"{i}. {item.date} {direction}{amount_display} "
             f"{item.description} [{cat}]{accounts}"
         )
         for warning in item.warnings:

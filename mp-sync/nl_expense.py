@@ -108,7 +108,7 @@ RESPONSE_SCHEMA = {
 
 @dataclass
 class ParsedExpense:
-    amount: float   # signed: negativo = gasto; transferencia = positivo
+    amount_cents: int  # Primary: signed integer cents (100 = $1.00). Negative = gasto
     description: str
     category: str   # "" si UNKNOWN
     date: str       # YYYY-MM-DD
@@ -119,6 +119,16 @@ class ParsedExpense:
     confidence: float = 1.0
     needs_confirmation: bool = False
     warnings: list[str] = field(default_factory=list)
+    
+    @property
+    def amount(self) -> float:
+        """Legacy accessor - returns float for backward compatibility (display only)."""
+        return self.amount_cents / 100.0
+    
+    @classmethod
+    def from_float(cls, amount_float: float, **kwargs):
+        """Factory method to create from float (for gradual migration)."""
+        return cls(amount_cents=int(round(amount_float * 100)), **kwargs)
 
 
 @dataclass
@@ -187,6 +197,8 @@ def _try_quick_parse(text: str, today: date, categories: list[str] | None = None
     Retorna None si el texto es ambiguo, contiene fechas relativas o decimales.
     Casos soportados:  'cafe 150'  '+500 sueldo'  '30k nafta'  '2 lucas uber'  'hoy cafe 150'
     """
+    from money_utils import parse_amount_to_cents
+    
     t = _QP_STRIP_RE.sub("", text.strip()).strip()
     if not t:
         return None
@@ -200,12 +212,23 @@ def _try_quick_parse(text: str, today: date, categories: list[str] | None = None
     raw_num = m.group(2)
     mult_str = (m.group(3) or "").lower()
     mult = _QP_MULTIPLIERS.get(mult_str, 1)
+    
+    # Parse to cents using safe utility
     try:
-        amount = float(raw_num) * mult
-    except ValueError:
+        amount_cents = parse_amount_to_cents(f"{raw_num}{mult_str}")
+        if amount_cents is None:
+            return None
+    except Exception:
+        # Fallback: try legacy parsing and convert
+        try:
+            amount_float = float(raw_num) * mult
+            amount_cents = int(round(amount_float * 100))
+        except ValueError:
+            return None
+    
+    if amount_cents == 0:
         return None
-    if amount == 0:
-        return None
+        
     before = t[: m.start()].strip()
     after = t[m.end() :].strip()
     desc_raw = f"{before} {after}".strip()
@@ -214,15 +237,17 @@ def _try_quick_parse(text: str, today: date, categories: list[str] | None = None
     if any(re.match(r"[\d.,]", tok) for tok in desc_raw.split()):
         return None
     description = desc_raw.title()
+    
     if sign_char == "+":
         tx_type = "ingreso"
-        signed_amount = amount
+        signed_cents = amount_cents
     else:
         tx_type = "gasto"
-        signed_amount = -amount
+        signed_cents = -amount_cents
+        
     category = _canonical_category(description, categories or [])
     return ParsedExpense(
-        amount=signed_amount,
+        amount_cents=signed_cents,
         description=description,
         category=category,
         date=today.isoformat(),
@@ -551,13 +576,16 @@ def _try_rule_parse_one(
         desc_raw = _strip_account_alias(desc_raw, account)
     description = _title_description(desc_raw)
     category = _canonical_category(f"{description} {desc_norm}", categories)
-    amount = float(value)
+    
+    # Convert Decimal to integer cents
+    amount_cents = int((value * 100).to_integral_value())
     if tx_type == "transferencia":
-        signed_amount = amount
+        signed_cents = amount_cents
     else:
-        signed_amount = amount if tx_type == "ingreso" else -amount
+        signed_cents = amount_cents if tx_type == "ingreso" else -amount_cents
+        
     return ParsedExpense(
-        amount=signed_amount,
+        amount_cents=signed_cents,
         description=description,
         category=category,
         date=date_str,
@@ -685,7 +713,10 @@ def parse_expense(
     )
     data = json.loads(resp.text)
 
-    amount = abs(float(data.get("monto", data.get("amount", 0)) or 0))
+    # Parse amount from LLM response and convert to cents
+    amount_float = abs(float(data.get("monto", data.get("amount", 0)) or 0))
+    amount_cents = int(round(amount_float * 100))
+    
     description = (data.get("descripcion") or data.get("description") or "").strip() or "Movimiento"
     category = (data.get("categoria") or data.get("category_name") or "").strip()
     cats_map = {c.lower(): c for c in categories}
@@ -699,11 +730,16 @@ def parse_expense(
     account_dest = (data.get("cuenta_destino") or "").strip()
 
     if tx_type == "transferencia":
-        signed_amount = amount  # transferencias son positivas
+        signed_cents = amount_cents  # transferencias son positivas
     else:
-        signed_amount = amount if tx_type == "ingreso" else -amount
-        signed_amount = _enforce_explicit_sign(text, signed_amount)
-        tx_type = "ingreso" if signed_amount > 0 else "gasto"
+        signed_cents = amount_cents if tx_type == "ingreso" else -amount_cents
+        # Apply explicit sign override if present in raw text
+        if signed_cents > 0 and text.strip().startswith('-'):
+            signed_cents = -signed_cents
+            tx_type = "gasto"
+        elif signed_cents < 0 and text.strip().startswith('+'):
+            signed_cents = abs(signed_cents)
+            tx_type = "ingreso"
 
     dstr = (data.get("fecha") or data.get("date") or today.isoformat()).strip()[:10]
     try:
@@ -712,7 +748,7 @@ def parse_expense(
         dstr = today.isoformat()
 
     return ParsedExpense(
-        amount=signed_amount,
+        amount_cents=signed_cents,
         description=description,
         category=category,
         date=dstr,
@@ -729,7 +765,7 @@ def parse_expense(
 class LedgerRow:
     date: str
     description: str
-    amount: float
+    amount_cents: int            # Primary: integer cents (100 = $1.00)
     category: str = ""
     account: str = ""
     account_dest: str = ""
@@ -738,6 +774,19 @@ class LedgerRow:
     source: str = "bot"          # "manual" | "bot"
     firefly_id: str = ""
     _row_index: int = -1         # id interno en SQLite
+    tx_fingerprint: str = ""     # Unique constraint for duplicate prevention
+    idempotency_key: str = ""    # For external API idempotency
+    
+    @property
+    def amount(self) -> float:
+        """Legacy accessor - returns float for backward compatibility (display only)."""
+        return self.amount_cents / 100.0
+    
+    @property
+    def amount_display(self) -> str:
+        """Formatted amount for display."""
+        from money_utils import cents_to_display
+        return cents_to_display(self.amount_cents, self.currency)
 
 
 @dataclass
@@ -854,6 +903,13 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
         "index on ledger_entries.firefly_id for get_unsynced queries",
         "CREATE INDEX IF NOT EXISTS idx_ledger_firefly_id ON ledger_entries(firefly_id)",
     ),
+    (
+        3,
+        "backfill amount_cents from legacy amount column",
+        """
+        UPDATE ledger_entries SET amount_cents = CAST(ROUND(amount * 100) AS INTEGER) WHERE amount_cents IS NULL;
+        """,
+    ),
 ]
 
 
@@ -940,10 +996,28 @@ class Ledger:
             self._ensure_column(conn, "ledger_entries", "account_dest", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "ledger_entries", "currency", "TEXT NOT NULL DEFAULT 'ARS'")
             self._ensure_column(conn, "ledger_entries", "tx_type", "TEXT NOT NULL DEFAULT 'gasto'")
+            # Migration: new columns for safe money handling
+            self._ensure_column(conn, "ledger_entries", "amount_cents", "INTEGER")
+            self._ensure_column(conn, "ledger_entries", "tx_fingerprint", "TEXT")
+            self._ensure_column(conn, "ledger_entries", "idempotency_key", "TEXT")
+            # Legacy index (kept for compatibility)
             conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_ledger_amount_date
                 ON ledger_entries(amount, date)
+                """
+            )
+            # NEW: Unique index for duplicate prevention
+            conn.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_ledger_fingerprint 
+                ON ledger_entries(tx_fingerprint) WHERE tx_fingerprint IS NOT NULL
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_ledger_idempotency 
+                ON ledger_entries(idempotency_key) WHERE idempotency_key IS NOT NULL
                 """
             )
             conn.execute(
@@ -1037,19 +1111,31 @@ class Ledger:
 
     @staticmethod
     def _row_to_ledger_row(row: sqlite3.Row) -> LedgerRow:
-        amount = float(row["amount"] or 0)
+        # Prefer amount_cents, fallback to legacy amount column for migration
+        amount_cents = row["amount_cents"]
+        if amount_cents is None:
+            # Backward compatibility: convert from legacy float
+            amount_cents = int(round((row["amount"] or 0) * 100))
+        
+        tx_type = (row["tx_type"] or "").strip()
+        if not tx_type:
+            # Infer from sign
+            tx_type = "ingreso" if amount_cents > 0 else "gasto"
+        
         return LedgerRow(
             date=(row["date"] or "").strip(),
             description=(row["description"] or "").strip(),
-            amount=amount,
+            amount_cents=amount_cents,
             category=(row["category"] or "").strip(),
             account=(row["account"] or "").strip(),
             account_dest=(row["account_dest"] or "").strip(),
             currency=(row["currency"] or "ARS").strip().upper(),
-            tx_type=(row["tx_type"] or ("ingreso" if amount > 0 else "gasto")).strip(),
+            tx_type=tx_type,
             source=(row["source"] or "manual").strip(),
             firefly_id=(row["firefly_id"] or "").strip(),
             _row_index=int(row["id"]),
+            tx_fingerprint=(row["tx_fingerprint"] or "").strip(),
+            idempotency_key=(row["idempotency_key"] or "").strip(),
         )
 
     def _migrate_legacy_csv(self) -> None:
@@ -1064,28 +1150,46 @@ class Ledger:
                 reader = csv.DictReader(f)
                 for row in reader:
                     try:
-                        amt = float((row.get("amount") or "0").replace(",", "."))
+                        amt_float = float((row.get("amount") or "0").replace(",", "."))
                     except ValueError:
-                        amt = 0.0
+                        amt_float = 0.0
+                    amt_cents = int(round(amt_float * 100))
+                    
+                    date_str = (row.get("date") or "").strip()
+                    desc_str = (row.get("description") or "").strip()
+                    
+                    # Generate fingerprint for migrated data
+                    from money_utils import generate_fingerprint, generate_idempotency_key
+                    fingerprint = generate_fingerprint(date_str, amt_cents, desc_str)
+                    idempotency_key = generate_idempotency_key(
+                        date_str, amt_cents, desc_str,
+                        (row.get("account") or "").strip(),
+                        (row.get("tx_type") or "").strip()
+                    )
+                    
                     rows.append(
                         (
-                            (row.get("date") or "").strip(),
-                            (row.get("description") or "").strip(),
-                            amt,
+                            date_str,
+                            desc_str,
+                            amt_float,  # Legacy
+                            amt_cents,  # New
                             (row.get("category") or "").strip(),
                             (row.get("account") or row.get("cuenta") or "").strip(),
                             (row.get("currency") or row.get("moneda") or "ARS").strip().upper(),
-                            (row.get("tx_type") or row.get("tipo") or ("ingreso" if amt > 0 else "gasto")).strip(),
+                            (row.get("tx_type") or row.get("tipo") or ("ingreso" if amt_float > 0 else "gasto")).strip(),
                             (row.get("source") or "manual").strip(),
                             (row.get("firefly_id") or "").strip(),
+                            fingerprint,
+                            idempotency_key,
                         )
                     )
             if rows:
                 conn.executemany(
                     """
                     INSERT INTO ledger_entries
-                    (date, description, amount, category, account, currency, tx_type, source, firefly_id)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (date, description, amount, amount_cents, category, account, currency, 
+                     tx_type, source, firefly_id, tx_fingerprint, idempotency_key)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     rows,
                 )
@@ -1113,7 +1217,9 @@ class Ledger:
         with self._db() as conn:
             rows = conn.execute(
                 """
-                SELECT id, date, description, amount, category, account, account_dest, currency, tx_type, source, firefly_id
+                SELECT id, date, description, amount, amount_cents, category, account, 
+                       account_dest, currency, tx_type, source, firefly_id,
+                       tx_fingerprint, idempotency_key
                 FROM ledger_entries
                 WHERE firefly_id IN ('', 'sync_partial')
                 ORDER BY id DESC
@@ -1160,7 +1266,9 @@ class Ledger:
         with self._db() as conn:
             rows = conn.execute(
                 """
-                SELECT id, date, description, amount, category, account, account_dest, currency, tx_type, source, firefly_id
+                SELECT id, date, description, amount, amount_cents, category, account, 
+                       account_dest, currency, tx_type, source, firefly_id,
+                       tx_fingerprint, idempotency_key
                 FROM ledger_entries
                 ORDER BY id DESC
                 LIMIT ?
@@ -1174,7 +1282,9 @@ class Ledger:
         with self._db() as conn:
             rows = conn.execute(
                 """
-                SELECT id, date, description, amount, category, account, account_dest, currency, tx_type, source, firefly_id
+                SELECT id, date, description, amount, amount_cents, category, account, 
+                       account_dest, currency, tx_type, source, firefly_id,
+                       tx_fingerprint, idempotency_key
                 FROM ledger_entries
                 WHERE description LIKE ? ESCAPE '\\' OR category LIKE ? ESCAPE '\\' OR firefly_id LIKE ? ESCAPE '\\'
                 ORDER BY id DESC
@@ -1201,7 +1311,7 @@ class Ledger:
             LedgerRow(
                 date=(row["date"] or "").strip(),
                 description=(row["description"] or "").strip(),
-                amount=float(row["amount"] or 0),
+                amount_cents=int(round(float(row["amount"] or 0) * 100)),  # Convert import to cents
                 category=(row["status"] or "import").strip(),
                 source="import",
                 firefly_id=(row["external_id"] or "").strip(),
@@ -1292,7 +1402,7 @@ class Ledger:
                     row._row_index if row else None,
                     external_id,
                     row.description if row else "",
-                    float(row.amount) if row else None,
+                    row.amount_cents if row else None,  # Log cents, not float
                     status,
                     message[:500],
                     chat_id,
@@ -1306,7 +1416,9 @@ class Ledger:
         with self._db() as conn:
             rows = conn.execute(
                 """
-                SELECT id, date, description, amount, category, account, account_dest, currency, tx_type, source, firefly_id
+                SELECT id, date, description, amount, amount_cents, category, account, 
+                       account_dest, currency, tx_type, source, firefly_id,
+                       tx_fingerprint, idempotency_key
                 FROM ledger_entries
                 ORDER BY id
                 """
@@ -1317,12 +1429,16 @@ class Ledger:
 
     def find_match(
         self,
-        amount: float,
+        amount_cents: int,
         date_str: str,
         *,
         tolerance_days: int = 1,
         description: str = "",
     ) -> LedgerRow | None:
+        """Find matching transaction by amount_cents, date, and description.
+        
+        Uses exact cents comparison - no floating point tolerance needed.
+        """
         try:
             target = datetime.strptime(date_str, "%Y-%m-%d").date()
         except ValueError:
@@ -1330,15 +1446,18 @@ class Ledger:
         date_lo = (target - timedelta(days=tolerance_days)).isoformat()
         date_hi = (target + timedelta(days=tolerance_days)).isoformat()
         with self._db() as conn:
+            # Use amount_cents with exact integer comparison
             rows = conn.execute(
                 """
-                SELECT id, date, description, amount, category, account, account_dest, currency, tx_type, source, firefly_id
+                SELECT id, date, description, amount, amount_cents, category, account, 
+                       account_dest, currency, tx_type, source, firefly_id,
+                       tx_fingerprint, idempotency_key
                 FROM ledger_entries
-                WHERE abs(amount - ?) < 0.005
+                WHERE (amount_cents = ? OR (amount_cents IS NULL AND CAST(ROUND(amount * 100) AS INTEGER) = ?))
                   AND date BETWEEN ? AND ?
                 ORDER BY date
                 """,
-                (float(amount), date_lo, date_hi),
+                (amount_cents, amount_cents, date_lo, date_hi),
             ).fetchall()
         if not rows:
             return None
@@ -1364,18 +1483,34 @@ class Ledger:
         candidates.sort(key=lambda t: t[0])
         return candidates[0][1]
 
-    def append(self, row: LedgerRow) -> int:
+    def append(self, row: LedgerRow) -> tuple[int, bool]:
+        """Atomic insert with duplicate prevention via fingerprint.
+        
+        Returns: (row_id, was_inserted) - was_inserted is False if duplicate
+        """
+        from money_utils import generate_fingerprint, generate_idempotency_key
+        
+        # Generate fingerprint for duplicate detection
+        fingerprint = generate_fingerprint(row.date, row.amount_cents, row.description)
+        idempotency_key = generate_idempotency_key(
+            row.date, row.amount_cents, row.description, row.account, row.tx_type
+        )
+        
         with self._db() as conn:
+            # Use INSERT OR IGNORE with fingerprint as unique constraint
+            # This eliminates the race condition in check-then-insert
             cur = conn.execute(
                 """
-                INSERT INTO ledger_entries
-                (date, description, amount, category, account, account_dest, currency, tx_type, source, firefly_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT OR IGNORE INTO ledger_entries
+                (date, description, amount, amount_cents, category, account, account_dest, 
+                 currency, tx_type, source, firefly_id, tx_fingerprint, idempotency_key)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     row.date,
                     row.description,
-                    float(row.amount),
+                    row.amount,  # Legacy: float for backward compatibility
+                    row.amount_cents,
                     row.category,
                     row.account,
                     row.account_dest,
@@ -1383,12 +1518,34 @@ class Ledger:
                     row.tx_type,
                     row.source,
                     row.firefly_id,
+                    fingerprint,
+                    idempotency_key,
                 ),
             )
-            return int(cur.lastrowid)
+            
+            if cur.lastrowid:
+                # New row inserted
+                row._row_index = int(cur.lastrowid)
+                row.tx_fingerprint = fingerprint
+                row.idempotency_key = idempotency_key
+                return (row._row_index, True)
+            else:
+                # Duplicate - fetch existing row
+                existing = conn.execute(
+                    "SELECT id FROM ledger_entries WHERE tx_fingerprint = ?",
+                    (fingerprint,)
+                ).fetchone()
+                if existing:
+                    return (int(existing["id"]), False)
+                # Should not happen, but return 0, False as fallback
+                return (0, False)
 
     def update_row(self, row_index: int, **fields) -> None:
-        allowed = {"date", "description", "amount", "category", "account", "account_dest", "currency", "tx_type", "source", "firefly_id"}
+        allowed = {
+            "date", "description", "amount", "amount_cents", "category", 
+            "account", "account_dest", "currency", "tx_type", "source", 
+            "firefly_id", "tx_fingerprint", "idempotency_key"
+        }
         updates = {k: v for k, v in fields.items() if k in allowed}
         if not updates:
             return
@@ -1408,7 +1565,9 @@ class Ledger:
         with self._db() as conn:
             row = conn.execute(
                 """
-                SELECT id, date, description, amount, category, account, account_dest, currency, tx_type, source, firefly_id
+                SELECT id, date, description, amount, amount_cents, category, account, 
+                       account_dest, currency, tx_type, source, firefly_id,
+                       tx_fingerprint, idempotency_key
                 FROM ledger_entries
                 ORDER BY id DESC
                 LIMIT 1
@@ -1431,13 +1590,16 @@ class RecordResult:
         if r.tx_type == "transferencia":
             sign = "=>"
         else:
-            sign = "-" if r.amount < 0 else "+"
+            sign = "-" if r.amount_cents < 0 else "+"
         cat = r.category or "(sin categoria)"
         account = f"  cuenta={r.account}" if r.account else ""
         if r.account_dest:
             account += f" => {r.account_dest}"
+        # Use cents_to_display for precise formatting
+        from money_utils import cents_to_display
+        amount_display = cents_to_display(r.amount_cents, r.currency)
         return (
-            f"[{self.action}] {r.date}  {sign}{r.currency} {abs(r.amount):,.2f}  "
+            f"[{self.action}] {r.date}  {sign}{amount_display}  "
             f"{r.description}  [{cat}]"
             + account
             + (f"  firefly#{r.firefly_id}" if r.firefly_id else "")
@@ -1454,13 +1616,13 @@ def record_expense(
     asset_accounts: dict[str, int] | None = None,
     currency: str = "ARS",
 ) -> RecordResult:
-    if parsed.amount == 0:
+    if parsed.amount_cents == 0:
         return RecordResult(
             action="noop",
             row=LedgerRow(
                 date=parsed.date,
                 description=parsed.description,
-                amount=0,
+                amount_cents=0,
                 category=parsed.category,
                 account=parsed.account,
                 currency=parsed.currency,
@@ -1470,7 +1632,7 @@ def record_expense(
         )
 
     match = ledger.find_match(
-        parsed.amount,
+        parsed.amount_cents,
         parsed.date,
         tolerance_days=0,
         description=parsed.description,
@@ -1538,10 +1700,11 @@ def record_expense(
         )
 
     # Nueva entrada — guardamos en ledger PRIMERO para no perder la operacion
+    # Usamos INSERT OR IGNORE con fingerprint para prevencion atomica de duplicados
     new_row = LedgerRow(
         date=parsed.date,
         description=parsed.description,
-        amount=parsed.amount,
+        amount_cents=parsed.amount_cents,
         category=parsed.category,
         account=parsed.account,
         account_dest=parsed.account_dest,
@@ -1549,8 +1712,29 @@ def record_expense(
         tx_type=parsed.tx_type,
         source="bot",
     )
-    idx = ledger.append(new_row)
+    idx, was_inserted = ledger.append(new_row)
+    
+    if not was_inserted:
+        # Duplicate detected atomically by database
+        existing = ledger.find_match(
+            parsed.amount_cents,
+            parsed.date,
+            tolerance_days=0,
+            description=parsed.description,
+        )
+        if existing and existing.firefly_id:
+            return RecordResult(
+                action="already_synced",
+                row=existing,
+                message="Transaccion ya existia (detectado por fingerprint).",
+            )
+        # Update idx to the existing row for potential sync
+        if existing:
+            idx = existing._row_index
+            new_row = existing
+    
     new_row._row_index = idx
+    
     try:
         fid = _push_firefly(
             new_row,
@@ -1568,10 +1752,12 @@ def record_expense(
             row=new_row,
             message=f"Guardado localmente. Firefly no respondio: {e}",
         )
+    
+    action = "created" if was_inserted else "synced_duplicate"
     return RecordResult(
-        action="created",
+        action=action,
         row=new_row,
-        message="Agregado al ledger y a Firefly.",
+        message="Agregado al ledger y a Firefly." if was_inserted else "Transaccion sincronizada (era duplicada).",
     )
 
 
@@ -1594,15 +1780,24 @@ def _push_firefly(
     currency: str,
     asset_accounts: dict[str, int] | None = None,
 ) -> str:
-    is_withdrawal = row.amount < 0
+    from money_utils import generate_idempotency_key
+    
+    is_withdrawal = row.amount_cents < 0
     account_id = resolve_asset_account_id(
         row.account,
         asset_accounts,
         default_asset_id=asset_id,
     )
-    amount_abs = f"{abs(row.amount):.2f}"
+    # Convert cents to decimal string for Firefly
+    amount_abs_cents = abs(row.amount_cents)
+    amount_abs = f"{amount_abs_cents // 100}.{amount_abs_cents % 100:02d}"
     desc = row.description or ("Gasto" if is_withdrawal else "Ingreso")
     tx_date = _firefly_transaction_date(row.date)
+    
+    # Generate idempotency key for external API call
+    idempotency_key = row.idempotency_key or generate_idempotency_key(
+        row.date, row.amount_cents, row.description, row.account, row.tx_type
+    )
 
     if row.tx_type == "transferencia":
         dest_id = resolve_asset_account_id(
@@ -1620,6 +1815,7 @@ def _push_firefly(
             "destination_id": dest_id,
             "tags": ["telegram-bot", "nl"],
             "notes": "Registrado via Telegram bot (lenguaje natural).",
+            "external_id": idempotency_key,  # Use as external_id for idempotency
         }
     else:
         tx: dict = {
@@ -1630,6 +1826,7 @@ def _push_firefly(
             "description": desc,
             "tags": ["telegram-bot", "nl"],
             "notes": "Registrado via Telegram bot (lenguaje natural).",
+            "external_id": idempotency_key,  # Use as external_id for idempotency
         }
         if is_withdrawal:
             tx["source_id"] = account_id
