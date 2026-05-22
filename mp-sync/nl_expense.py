@@ -21,7 +21,7 @@ import unicodedata
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 
 from google import genai
@@ -296,7 +296,7 @@ _CATEGORY_HINTS: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
     # Personal (peluqueria, cuidado personal)
     (("peluqueria", "peluquero", "barberia", "barbero", "corte de pelo", "estetica", "manicuria", "depilacion", "spa"), ("Personal",)),
     # Farmacia / salud
-    (("farmacia", "farma", "medicamento", "remedio", "medico", "doctor", "clinica", "hospital", "laboratorio", "dentista"), ("Farmacia",)),
+    (("farmacia", "farma", "medicamento", "remedio", "medico", "doctor", "clinica", "hospital", "laboratorio", "dentista", "preservativo", "preservativos", "farmacity"), ("Farmacia",)),
     # Deportes
     (("gym", "gimnasio", "cancha", "pileta", "natacion", "deporte", "rugby", "tenis", "padel", "running", "fitness"), ("Deportes",)),
     # Futbol
@@ -631,7 +631,6 @@ def parse_expenses(
     if parsed:
         if (
             len(parsed) == 1
-            and parsed[0].tx_type == "gasto"
             and not parsed[0].needs_confirmation
             and categories
             and not parsed[0].category
@@ -682,7 +681,7 @@ def parse_expense(
             return rule_result.transactions[0]
     quick = _try_quick_parse(text, today, categories)
     if quick is not None:
-        if quick.category or quick.tx_type != "gasto" or not categories:
+        if quick.category or not categories:
             log.debug("quick-parse ok (LLM skipped): %r -> %.2f desc=%r", text, quick.amount, quick.description)
             quick.currency = default_currency
             return quick
