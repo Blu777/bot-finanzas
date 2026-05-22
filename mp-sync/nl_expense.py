@@ -715,9 +715,9 @@ def parse_expense(
     )
     data = json.loads(resp.text)
 
-    # Parse amount from LLM response and convert to cents
-    amount_float = abs(float(data.get("monto", data.get("amount", 0)) or 0))
-    amount_cents = int(round(amount_float * 100))
+    # Parse amount from LLM response using Decimal for precision
+    amount_decimal = abs(Decimal(str(data.get("monto", data.get("amount", 0)) or 0)))
+    amount_cents = int((amount_decimal * Decimal(100)).quantize(Decimal('1'), rounding=ROUND_HALF_UP))
     
     description = (data.get("descripcion") or data.get("description") or "").strip() or "Movimiento"
     category = (data.get("categoria") or data.get("category_name") or "").strip()
@@ -727,7 +727,9 @@ def parse_expense(
     account = (data.get("cuenta") or "").strip()
     tx_type = (data.get("tipo") or "").strip().lower()
     if tx_type not in {"ingreso", "gasto", "transferencia"}:
-        tx_type = "ingreso" if float(data.get("amount") or 0) > 0 else "gasto"
+        # Determine tx_type from amount sign using Decimal
+        raw_amount = Decimal(str(data.get("amount") or 0))
+        tx_type = "ingreso" if raw_amount > 0 else "gasto"
 
     account_dest = (data.get("cuenta_destino") or "").strip()
 
@@ -923,8 +925,8 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
     ),
     (
         6,
-        "add sync_status column for reliable sync tracking",
-        "ALTER TABLE ledger_entries ADD COLUMN sync_status TEXT DEFAULT 'pending'",
+        "placeholder - sync_status added by _ensure_column()",
+        "SELECT 1",
     ),
     (
         7,
@@ -1219,10 +1221,11 @@ class Ledger:
                 reader = csv.DictReader(f)
                 for row in reader:
                     try:
-                        amt_float = float((row.get("amount") or "0").replace(",", "."))
-                    except ValueError:
-                        amt_float = 0.0
-                    amt_cents = int(round(amt_float * 100))
+                        amt_str = (row.get("amount") or "0").replace(",", ".")
+                        amt_decimal = Decimal(amt_str)
+                    except (ValueError, InvalidOperation):
+                        amt_decimal = Decimal(0)
+                    amt_cents = int((amt_decimal * Decimal(100)).quantize(Decimal('1'), rounding=ROUND_HALF_UP))
                     
                     date_str = (row.get("date") or "").strip()
                     desc_str = (row.get("description") or "").strip()
@@ -1236,12 +1239,12 @@ class Ledger:
                         (
                             date_str,
                             desc_str,
-                            amt_float,  # Legacy
-                            amt_cents,  # New
+                            float(amt_decimal),  # Legacy: float for backward compat
+                            amt_cents,  # New: integer cents
                             (row.get("category") or "").strip(),
                             (row.get("account") or row.get("cuenta") or "").strip(),
                             (row.get("currency") or row.get("moneda") or "ARS").strip().upper(),
-                            (row.get("tx_type") or row.get("tipo") or ("ingreso" if amt_float > 0 else "gasto")).strip(),
+                            (row.get("tx_type") or row.get("tipo") or ("ingreso" if amt_decimal > 0 else "gasto")).strip(),
                             (row.get("source") or "manual").strip(),
                             (row.get("firefly_id") or "").strip(),
                             fingerprint,
@@ -1303,14 +1306,33 @@ class Ledger:
         currency: str = "ARS",
         limit: int = 50,
     ) -> tuple[int, int]:
-        """Reintenta sincronizar con Firefly las entradas pending o failed.
+        """Reintenta sincronizar con Firefly las entradas pending (solo 'pending', no 'failed').
+
+        Solo reintenta entradas con sync_status='pending' para evitar duplicados
+        en Firefly (una entrada 'failed' podria haber sido creada en Firefly
+        pero la respuesta se perdio).
 
         Retorna (ok, failed).
         """
-        pending = self.get_unsynced(limit=limit)
+        # Solo reintentar entradas 'pending', no 'failed'
+        with self._db() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, date, description, amount, amount_cents, category, account,
+                       account_dest, currency, tx_type, source, firefly_id,
+                       tx_fingerprint, idempotency_key, sync_status
+                FROM ledger_entries
+                WHERE sync_status = 'pending'
+                ORDER BY id
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            to_retry = [self._row_to_ledger_row(r) for r in rows]
+
         ok = 0
         failed = 0
-        for row in pending:
+        for row in to_retry:
             try:
                 fid = _push_firefly(
                     row,

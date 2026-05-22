@@ -39,7 +39,10 @@ from firefly_client import FireflyClient, FireflyError
 from firefly_import import import_csv_file
 from gemini_config import DEFAULT_GEMINI_MODEL
 from gemini_categorizer import categorize_pending
-from nl_expense import Ledger, parse_asset_account_map, parse_expenses, record_expense
+from nl_expense import (
+    Ledger, parse_asset_account_map, parse_expenses, record_expense,
+    start_background_sync_worker,
+)
 
 
 logging.basicConfig(
@@ -67,6 +70,15 @@ LOCAL_LEDGER_CSV = _cfg.local_ledger_csv
 
 client = FireflyClient(FIREFLY_URL, FIREFLY_TOKEN)
 ledger = Ledger(LOCAL_LEDGER_CSV)
+
+# Start background sync worker for automatic retry of failed/pending syncs
+start_background_sync_worker(
+    ledger=ledger,
+    firefly=client,
+    asset_id=ASSET_ID,
+    asset_accounts=ASSET_ACCOUNTS,
+    interval_seconds=300,  # 5 minutes
+)
 
 
 def _validate_asset_accounts():

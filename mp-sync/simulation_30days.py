@@ -298,8 +298,8 @@ def simulate_transaction(
                 if existing:
                     result["firefly_synced"] = True
                     result["firefly_id"] = existing["id"]
-                    # Update local with firefly_id
-                    ledger.update_row(idx, firefly_id=str(existing["id"]))
+                    # Update local with firefly_id and mark as synced
+                    ledger.update_row(idx, firefly_id=str(existing["id"]), sync_status="synced")
                     return result
         
         # Try to sync to Firefly
@@ -327,17 +327,25 @@ def simulate_transaction(
                 result["firefly_synced"] = True
                 result["firefly_id"] = firefly_id
                 
-                # Update local ledger with firefly_id
-                ledger.update_row(idx, firefly_id=str(firefly_id))
+                # Update local ledger with firefly_id and mark as synced
+                ledger.update_row(idx, firefly_id=str(firefly_id), sync_status="synced")
                 
             except Exception as e:
                 result["error"] = f"Firefly sync failed: {e}"
-                # Row stays unsynced in local ledger
+                # Mark as failed in local ledger
+                ledger.update_row(idx, sync_status="failed")
         else:
             result["error"] = "Simulated API failure"
+            # Mark as failed due to simulated API failure
+            ledger.update_row(idx, sync_status="failed")
     
     except Exception as e:
         result["error"] = f"Exception: {e}"
+        # Mark as failed on exception
+        try:
+            ledger.update_row(idx, sync_status="failed")
+        except:
+            pass  # Ignore if row doesn't exist yet
     
     return result
 
