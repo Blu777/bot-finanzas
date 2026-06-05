@@ -50,8 +50,7 @@ SYSTEM_PROMPT = (
     "a la cuenta asset; 'transferencia' si mueve dinero entre cuentas asset. "
     "Si no aclara, asumi gasto.\n"
     "- cuenta: cuenta asset de ORIGEN (de donde sale el dinero). Usar alias corto "
-    "de las cuentas conocidas (ej: Efectivo, Banco, MP). Si no se menciona, dejar "
-    "vacio para que el bot use la cuenta por defecto.\n"
+    "de las cuentas conocidas (ej: Efectivo, Banco, MP). Si no se menciona, asumi 'MP'.\n"
     "- cuenta_destino: cuenta asset de DESTINO (a donde llega el dinero). Solo "
     "para tipo=transferencia. Si no se menciona, dejar vacio.\n"
     "- IMPORTANTE: si el usuario pone un signo explicito (- o +) antes del monto, "
@@ -253,6 +252,7 @@ def _try_quick_parse(text: str, today: date, categories: list[str] | None = None
         description=description,
         category=category,
         date=today.isoformat(),
+        account="MP",
         tx_type=tx_type,
     )
 
@@ -529,6 +529,8 @@ def _try_rule_parse_one(
     desc_norm = _strip_accents(desc_raw.lower())
     segment_norm = _strip_accents(segment.lower())
     account = _find_account_alias(segment, account_aliases)
+    if not account:
+        account = "MP"
     account_dest = ""
     tx_type = "gasto"
     confidence = 0.92
@@ -724,6 +726,8 @@ def parse_expense(
     if category and category.lower() in cats_map:
         category = cats_map[category.lower()]
     account = (data.get("cuenta") or "").strip()
+    if not account:
+        account = "MP"
     tx_type = (data.get("tipo") or "").strip().lower()
     if tx_type not in {"ingreso", "gasto", "transferencia"}:
         # Determine tx_type from amount sign using Decimal
